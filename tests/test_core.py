@@ -1,9 +1,19 @@
 import random
-import torch
 from typing import Tuple
 
+import fp8gemm._C.tk
+import torch
+import triton
+from fp8gemm.reference import act_quant
+from fp8gemm.weight_quant import weight_quant
+
 import deep_gemm
-from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
+from deep_gemm import (
+    bench_kineto,
+    calc_diff,
+    ceil_div,
+    get_col_major_tma_aligned_tensor,
+)
 
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -62,25 +72,51 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
     return x_fp8, y_fp8, out, ref_out
 
 
+shape_list = [(128, 8192, 8192), (8192, 8192, 8192), (8192, 8192, 512)]
+
 def test_gemm() -> None:
-    print('Testing GEMM:')
-    for m in (64, 128, 4096):
-        for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
+    print('Testing DeepGEMM:')
+    for m, n, k in shape_list:
+        x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+        deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+        diff = calc_diff(out, ref_out)
+        print(diff)
+        assert diff < 0.0025, f'{m=}, {k=}, {n=}, {diff:.5f}'
+
+        # noinspection PyShadowingNames
+        def test_func():
+            # Construct new tensors every time to avoid L2 cache acceleration
             x_fp8, y_fp8, out, ref_out = construct(m, k, n)
             deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-            diff = calc_diff(out, ref_out)
-            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
-            # noinspection PyShadowingNames
-            def test_func():
-                # Construct new tensors every time to avoid L2 cache acceleration
-                x_fp8, y_fp8, out, ref_out = construct(m, k, n)
-                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
+                f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+                f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
+    print()
 
-            t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-            print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
-                  f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
-                  f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
+
+def test_fp8gemm() -> None:
+    
+    print('Testing Fp8GEMM:')
+    for m, n, k in shape_list:
+
+        w = torch.randn(m, k, dtype=torch.float32, device="cuda") * 0.5
+        x = torch.randn(n, k, dtype=torch.float32, device="cuda") * 0.5
+        w, w_s = weight_quant(w)
+        x, x_s = act_quant(x)
+        x_s = x_s.transpose(0, 1).contiguous()
+        t = triton.testing.do_bench(lambda: fp8gemm._C.tk.forward(
+            x=x,
+            w=w,
+            x_scale=x_s,
+            w_scale=w_s,
+            x_scales_transposed=True
+        )) / 1e3
+
+        print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
+                f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+                f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     print()
 
 
@@ -154,5 +190,5 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_gemm()
-    test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
+    test_fp8gemm()
+

@@ -1,8 +1,14 @@
-import torch
 from typing import Tuple
 
+import torch
+
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
+from .utils import (
+    ceil_div,
+    get_col_major_tma_aligned_tensor,
+    get_m_alignment_for_contiguous_layout,
+    get_num_sms,
+)
 
 # C++ code templates
 includes = ('"deep_gemm/fp8_gemm.cuh"', )
@@ -152,6 +158,9 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     global includes, template
     num_sms = get_num_sms()
     block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
+    block_m, block_n, num_stages, num_tma_multicast = 128, 128, 4, 1
+    #print('*'*100)
+    #print('{}, {}, {}, block_m: {}, block_n: {}, num_stages: {}, num_tma_multicast {}'.format(m, n, k, block_m, block_n, num_stages, num_tma_multicast))
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',

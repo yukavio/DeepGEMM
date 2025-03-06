@@ -14,7 +14,7 @@ template <GemmType kGemmType,
           uint32_t SHAPE_N, uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumGroups, uint32_t kNumTMAMulticast,
           uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N),
-          uint32_t kNumNBlocksPerGroup = 16>
+          uint32_t kNumNBlocksPerGroup = 8>
 struct Scheduler {
     int current_iter = -1;
     uint32_t num_aligned_m_blocks;
@@ -46,13 +46,21 @@ struct Scheduler {
         DG_STATIC_ASSERT(kNumNBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
         // Swizzle for better L2 usages
-        auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup;
+        // auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup;
+        // auto group_idx = block_idx / num_blocks_per_group;
+        // auto first_n_block_idx = group_idx * kNumNBlocksPerGroup;
+        // auto num_n_blocks_in_group = min(kNumNBlocksPerGroup, kNumNBlocks - first_n_block_idx);
+        // auto in_group_idx = block_idx % num_blocks_per_group;
+        // m_block_idx = in_group_idx / num_n_blocks_in_group;
+        // n_block_idx = first_n_block_idx + in_group_idx % num_n_blocks_in_group;
+
+        auto num_blocks_per_group = SHAPE_N / BLOCK_N * kNumNBlocksPerGroup;
         auto group_idx = block_idx / num_blocks_per_group;
-        auto first_n_block_idx = group_idx * kNumNBlocksPerGroup;
-        auto num_n_blocks_in_group = min(kNumNBlocksPerGroup, kNumNBlocks - first_n_block_idx);
+        auto first_m_block_idx = group_idx * kNumNBlocksPerGroup;
+        auto num_m_blocks_in_group = min(kNumNBlocksPerGroup, num_aligned_m_blocks - first_m_block_idx);
         auto in_group_idx = block_idx % num_blocks_per_group;
-        m_block_idx = in_group_idx / num_n_blocks_in_group;
-        n_block_idx = first_n_block_idx + in_group_idx % num_n_blocks_in_group;
+        n_block_idx = in_group_idx / num_m_blocks_in_group;
+        m_block_idx = first_m_block_idx + in_group_idx % num_m_blocks_in_group;
     }
 
     template <bool kIgnoreGroupedForGroupedContiguous=true>
