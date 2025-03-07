@@ -163,7 +163,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
                     // NOTES: unrolling and `kNumInnerStages` are vital for performance, NVCC will try to eliminate all
                     // shared memory pointers, e.g. `full_barriers` registers, if all the access indices are constant
-
+#pragma unroll 1
                     for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
                         // Wait consumer release
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
@@ -228,14 +228,6 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             }
             uint32_t num_scales_b = SHAPE_K_SCALES * (num_former_iters >= num_full_iters ? 1 : 2);
 
-            // Load B scales with math warp-groups
-            // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
-            // if (threadIdx.x >= 32) {
-            //     auto local_scales_b = scales_b + ((n_block_idx * BLOCK_N) / BLOCK_K) * SHAPE_K_SCALES;
-            //     #pragma unroll
-            //     for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
-            //         st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
-            // }
             cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 
             // Accumulation for WGMMA or CUDA promotion
@@ -256,24 +248,11 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
                 DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
-
+#pragma unroll 1
                 for (int s = 0; s < kNumInnerStages; ++ s) {
                     // Wait TMA arrivals
                     full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
                     
-                    // // Read B scales
-                    // float scale_b_0 = ld_shared(smem_scales_b), scale_b_1;
-                    // // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
-                    // if constexpr (not kMustUseUniformedScaleB)
-                    //     scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
-
-                    // // // Wait TMA arrivals
-                    // // full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
-
-                    // // Read A scales
-                    // // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
-                    // auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0), scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
-
                     // Commit WGMMA instructions
                     #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum; ++ i)
