@@ -179,8 +179,6 @@ fp8_gemm_bw_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         tma_copy(&tensor_map_scales_b, reinterpret_cast<uint64_t*>(&full_barrier),
                                  smem_scales_b[s], n_block_idx * BLOCK_N, scheduler.get_global_idx(0, 1, k_idx / BLOCK_K));
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE + SMEM_SCALES_B_SIZE_PER_STAGE);
-                        // full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
-
                     }
 
                     // Wait unaligned cases
@@ -268,7 +266,7 @@ fp8_gemm_bw_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     empty_barrier_arrive(s);
 
                     #pragma unroll
-                    for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) { // WGMMA::kNumAccum = 64, loop 16 steps
+                    for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                         int src_lane_id = threadIdx.x % 4 + (i % 8) * 4;
                         float scale_b_0 = __shfl_sync(0xffffffff, scale_b[i/8].x, src_lane_id);
                         float scale_b_1 = __shfl_sync(0xffffffff, scale_b[i/8].y, src_lane_id);
