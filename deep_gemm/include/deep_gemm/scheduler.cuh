@@ -1,3 +1,4 @@
+#pragma once
 #include "utils.cuh"
 
 namespace deep_gemm {
