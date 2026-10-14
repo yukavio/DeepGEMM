@@ -109,6 +109,30 @@ Use `m_grouped_gemm_fp8_fp8_bf16_nt_masked` for this purpose and consult the rel
 
 For the FP4 masked GEMM, the `silu_and_mul` activation and the MXFP4 quantization that follows it can optionally be fused into the epilogue, so that MoE gemm1 writes the packed FP4 values and their E8M0 scales directly instead of a BF16 tensor that a standalone kernel has to read back. The fusion is **disabled by default**; pass an `out_scale` tensor to `deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked` to enable it, and interleave the gemm1 weight once with `deep_gemm.preprocess_mxfp4_weight_for_act_and_quant_fusing` beforehand. Refer to the `m_grouped_gemm_fp4_fp4_bf16_nt_masked` documentation for the tensor layouts, the `swiglu_limit` argument and the current limitations.
 
+#### Two-stage MegaMoE (MXFP4)
+
+Initialize the process group, allocate a symmetric buffer, and transform the local
+FP4 weights once. Weight scales must be raw `uint8` UE8M0 values; `w13` rows are
+ordered as `[gate...][up...]`.
+
+```python
+import torch
+import deep_gemm
+
+buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden)
+l1_weights, l2_weights = deep_gemm.transform_weights_for_mega_moe(
+    (w13_fp4, w13_scales), (w2_fp4, w2_scales))
+
+# Per forward: BF16 inputs, int32 routing IDs, and float32 routing weights.
+output = torch.empty_like(hidden_states)
+deep_gemm.mega_moe_pre_dispatch(
+    hidden_states, topk_ids, topk_weights, sym_buffer=buffer)
+deep_gemm.fp4_fp4_mega_moe(output, l1_weights, l2_weights, buffer)
+```
+
+See [test_mega_moe.py](tests/test_mega_moe.py) for a complete example.
+
 #### Fused MoE (with implicit permute)
 
 Unlike the standalone grouped GEMM layouts above (which expect tokens to already be routed and grouped per expert), the fused MoE path takes raw MoE routing results (`topk_ids`) and fuses the token permutation, per-expert block alignment, and grouped GEMM into a single flow. The "with implicit permute" naming distinguishes it from a plain grouped MoE GEMM: the permutation from token order to expert-grouped order is computed and applied inside these kernels, so no separate gather/scatter step is required.

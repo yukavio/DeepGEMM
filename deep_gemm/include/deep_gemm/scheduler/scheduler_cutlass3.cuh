@@ -5,6 +5,7 @@
 */
 
 #include <deep_gemm/common/utils_rtc.cuh>
+#include <type_traits>
 #include <cutlass/coord.h>
 #include <cutlass/kernel_hardware_info.h>
 #include <cutlass/workspace.h>
@@ -12,6 +13,7 @@
 #include <cutlass/fast_math.h>
 #include <cutlass/gemm_coord.hpp>
 #include <cutlass/cutlass.h>
+#include <deep_gemm/layout/sym_buffer.cuh>
 ////////////////////////////////////////////////////////////////////////////////
 
 #define EnableGroupNoPadOpt
@@ -19,10 +21,52 @@
 // namespace cutlass::gemm::kernel {
 namespace deep_gemm {
 using cutlass::KernelHardwareInfo;
+
 struct TileSchedulerArguments
 {
     int* grouped_layout;
     uint32_t shape_m;
+
+    CUTLASS_HOST_DEVICE
+    TileSchedulerArguments(uint32_t shape_m = 0, int* grouped_layout_ptr = nullptr)
+        : grouped_layout(grouped_layout_ptr), shape_m(shape_m) {}
+};
+using TileSchedulerParams = TileSchedulerArguments;
+
+struct MegaMoESchedulerArguments
+{
+    int* grouped_layout;
+    // Fused preprocess writes masked_m through grouped_layout, but both its
+    // scheduler and copy CTAs consume the block-granular copy_grouped_layout.
+    int* copy_grouped_layout;
+    uint32_t shape_m;
+
+    // Inclusive [local expert, source rank] row prefixes.
+    const uint32_t* expert_rank_prefix;
+
+    // Local HBM staging buffer for block-copy
+    uint8_t* local_fp4_buf;
+    // Local HBM SFA prepared by the device-fused overlap roles. Copy CTAs only
+    // publish FP4.
+    uint16_t* local_sfa_buf;
+
+    // Dedicated copy blocks
+    volatile uint32_t* copy_ready_flags;
+    uint32_t num_copy_blocks;
+
+    // Exact-shape device preprocess fusion.  Generation-tagged flags avoid a
+    // per-round memset: [0] publishes grouped/copy metadata, followed by
+    // three pushed-SFA subgroup flags for each local expert.
+    layout::SymBuffer<> sym_buffer;
+    uint8_t* local_dispatch;
+    volatile uint32_t* preprocess_ready_flags;
+    // Exclusive routed-row prefix per local expert, plus one total entry.
+    uint32_t* expert_base;
+    void* src_info;
+
+    uint8_t* local_staging;
+    // EP-group rank, independent of the node-local device index.
+    uint32_t local_source_rank;
 
     //
     // Methods
@@ -30,22 +74,81 @@ struct TileSchedulerArguments
 
     /// Ctor
     CUTLASS_HOST_DEVICE
-    TileSchedulerArguments()
+    MegaMoESchedulerArguments()
         : grouped_layout(nullptr)
+        , copy_grouped_layout(nullptr)
         , shape_m(0)
+        , expert_rank_prefix(nullptr)
+        , local_fp4_buf(nullptr)
+        , local_sfa_buf(nullptr)
+        , copy_ready_flags(nullptr)
+        , num_copy_blocks(0)
+        , sym_buffer{}
+        , local_dispatch(nullptr)
+        , preprocess_ready_flags(nullptr)
+        , expert_base(nullptr)
+        , src_info(nullptr)
+        , local_staging(nullptr)
+        , local_source_rank(0)
     {
     }
 
-    /// Ctor
+    /// Ctor (non-fused)
     CUTLASS_HOST_DEVICE
-    TileSchedulerArguments(uint32_t shape_m, int* grouped_layout_ptr = nullptr)
+    MegaMoESchedulerArguments(uint32_t shape_m, int* grouped_layout_ptr = nullptr)
         : grouped_layout(grouped_layout_ptr)
+        , copy_grouped_layout(nullptr)
         , shape_m(shape_m)
+        , expert_rank_prefix(nullptr)
+        , local_fp4_buf(nullptr)
+        , local_sfa_buf(nullptr)
+        , copy_ready_flags(nullptr)
+        , num_copy_blocks(0)
+        , sym_buffer{}
+        , local_dispatch(nullptr)
+        , preprocess_ready_flags(nullptr)
+        , expert_base(nullptr)
+        , src_info(nullptr)
+        , local_staging(nullptr)
+        , local_source_rank(0)
+    {
+    }
+
+    /// Ctor (block-copy fused dispatch)
+    CUTLASS_HOST_DEVICE
+    MegaMoESchedulerArguments(uint32_t shape_m, int* grouped_layout_ptr,
+                           int* copy_grouped_layout_ptr,
+                           const uint32_t* expert_rank_prefix_,
+                           uint8_t* local_fp4_buf_,
+                           uint16_t* local_sfa_buf_,
+                           volatile uint32_t* copy_ready_flags_,
+                           uint32_t num_copy_blocks_,
+                           const layout::SymBuffer<>& sym_buffer_ = {},
+                           uint8_t* local_dispatch_ = nullptr,
+                           volatile uint32_t* preprocess_ready_flags_ = nullptr,
+                           uint32_t* expert_base_ = nullptr,
+                           void* src_info_ = nullptr,
+                           uint8_t* local_staging_ = nullptr,
+                           uint32_t local_source_rank_ = 0)
+        : grouped_layout(grouped_layout_ptr)
+        , copy_grouped_layout(copy_grouped_layout_ptr)
+        , shape_m(shape_m)
+        , expert_rank_prefix(expert_rank_prefix_)
+        , local_fp4_buf(local_fp4_buf_)
+        , local_sfa_buf(local_sfa_buf_)
+        , copy_ready_flags(copy_ready_flags_)
+        , num_copy_blocks(num_copy_blocks_)
+        , sym_buffer(sym_buffer_)
+        , local_dispatch(local_dispatch_)
+        , preprocess_ready_flags(preprocess_ready_flags_)
+        , expert_base(expert_base_)
+        , src_info(src_info_)
+        , local_staging(local_staging_)
+        , local_source_rank(local_source_rank_)
     {
     }
 
 };
-using TileSchedulerParams = TileSchedulerArguments;
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
@@ -57,22 +160,43 @@ template <GemmType kGemmType,
           uint32_t BLOCK_M_, uint32_t BLOCK_N_,
           uint32_t kNumGroups_,
           uint32_t kNumNBlocks = ceil_div(SHAPE_N_, BLOCK_N_),
-          uint32_t kNum1DBlocksPerGroup = 2,
+          uint32_t kNum1DBlocksPerGroup_ = 2,
           EpilogueType kEpilogueType = EpilogueType::Default,
-          bool kTransposedBatchOutput = true>
+          bool kTransposedBatchOutput = true,
+          uint32_t kNumRanks_ = 1,
+          uint32_t kNumCopyBlocks_ = 0,
+          uint32_t kKTilesPerFlag_ = 0,
+          uint32_t kSourceCapacity_ = 1,
+          uint32_t kNumTopK_ = 1>
 struct DeepGemmScheduler {
     constexpr static uint32_t SHAPE_N = SHAPE_N_;
     constexpr static uint32_t SHAPE_K = SHAPE_K_;
     constexpr static uint32_t BLOCK_M = BLOCK_M_;
     constexpr static uint32_t BLOCK_N = BLOCK_N_;
     constexpr static uint32_t kNumGroups = kNumGroups_;
-    constexpr static uint32_t SHAPE_N_OUT = EpilogueTraits<kEpilogueType>::get_shape_n_out(SHAPE_N);
+    constexpr static uint32_t SHAPE_N_OUT =
+        EpilogueTraits<kEpilogueType>::get_shape_n_out(SHAPE_N);
+    constexpr static uint32_t kNum1DBlocksPerGroup = kNum1DBlocksPerGroup_;
+    constexpr static uint32_t kNumRanks = kNumRanks_;
+    constexpr static uint32_t kNumCopyBlocks = kNumCopyBlocks_;
+    constexpr static uint32_t kKTilesPerFlag = kKTilesPerFlag_;
+    constexpr static uint32_t kSourceCapacity = kSourceCapacity_;
+    constexpr static uint32_t kNumTopK = kNumTopK_;
     int current_iter = 0;
     uint32_t num_aligned_m_blocks;
     constexpr static GemmType GEMM_TYPE = kGemmType;
+    constexpr static bool kIsMegaMoE = kGemmType == GemmType::MegaMoE;
+    constexpr static bool kIsFusedDispatch =
+        kIsMegaMoE && kEpilogueType == EpilogueType::SiluAndMulPostQuantFp4;
+    constexpr static bool kIsMaskedLayout =
+        kGemmType == GemmType::GroupedMasked || kIsFusedDispatch;
+    constexpr static bool kIsNoPadLayout =
+        kGemmType == GemmType::GroupedNoPad || (kIsMegaMoE && !kIsFusedDispatch);
     constexpr static bool kIsTMAMulticastOnA = false;
 #ifdef EnableGroupNoPadOpt
-    constexpr static bool kIsNoPadPreprocessLayout = (kGemmType == GemmType::GroupedNoPad||kGemmType == GemmType::GroupedFused) && kNumGroups >= 128;
+    constexpr static bool kIsNoPadPreprocessLayout =
+        (kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused) &&
+        kNumGroups >= 128;
 #else
     constexpr static bool kIsNoPadPreprocessLayout = false;
 #endif
@@ -84,9 +208,12 @@ struct DeepGemmScheduler {
 
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum, curr_cumsum_blocks, curr_group_m, curr_cumsum_m;
+    // Only fused dispatch consumers address the global copy-ready array.
+    uint32_t curr_global_block_m_idx = 0;
     // Host-callable methods and type definitions
-    using Arguments = TileSchedulerArguments;
-    using Params = TileSchedulerParams;
+    using Arguments = std::conditional_t<kIsFusedDispatch,
+                                         MegaMoESchedulerArguments, TileSchedulerArguments>;
+    using Params = Arguments;
     Params const& params;
 
 #if defined(__HGGC__)
@@ -98,9 +225,18 @@ struct DeepGemmScheduler {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
         } else if constexpr(kGemmType == GemmType::GroupedContiguous) {
             num_blocks = num_aligned_m_blocks * num_n_blocks;
-        } else if constexpr(kGemmType == GemmType::GroupedMasked) {
+        } else if constexpr(kIsFusedDispatch) {
+            // Fused preprocess already materializes one block-granular uint4
+            // record per M block for the copy CTAs. Reuse its total here so
+            // fetch_next_work can address records directly instead of
+            // rebuilding expert block prefixes from masked_m for every tile.
+            num_aligned_m_blocks = params_.copy_grouped_layout[0];
+            num_blocks = num_aligned_m_blocks * num_n_blocks;
+            curr_group_idx = curr_cumsum = curr_group_m =
+                curr_cumsum_blocks = curr_cumsum_m = 0;
+        } else if constexpr(kIsMaskedLayout) {
             curr_group_idx = curr_cumsum = curr_group_m = curr_cumsum_blocks = curr_cumsum_m = 0;
-        } else if constexpr(kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused) {
+        } else if constexpr(kIsNoPadLayout || kGemmType == GemmType::GroupedFused) {
             if constexpr(kIsNoPadPreprocessLayout) {
                 num_aligned_m_blocks = params_.grouped_layout[0]; // total blocks in m, block_m_sum
                 curr_group_idx = curr_cumsum = curr_cumsum_blocks = curr_group_m = curr_cumsum_m = 0;
@@ -116,11 +252,17 @@ struct DeepGemmScheduler {
         // Swizzle for better L2 usages
         auto primary_num_blocks = kIsTMAMulticastOnA ? kNumNBlocks : num_m_blocks;
         auto secondary_num_blocks = kIsTMAMulticastOnA ? num_m_blocks : (kNumNBlocks / n_expand);
-        auto num_blocks_per_group = secondary_num_blocks * kNum1DBlocksPerGroup;
+        // A sparse expert has too few M blocks to benefit from the larger
+        // scatter swizzle; preserve the original two-block ordering for it.
+        const uint32_t group_span =
+            kIsMegaMoE && kNum1DBlocksPerGroup >= 16 &&
+            num_m_blocks < kNum1DBlocksPerGroup
+                ? 2u : kNum1DBlocksPerGroup;
+        auto num_blocks_per_group = secondary_num_blocks * group_span;
         auto group_idx = block_idx / num_blocks_per_group;
-        auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
+        auto first_block_idx = group_idx * group_span;
         auto in_group_idx = block_idx % num_blocks_per_group;
-        uint32_t num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
+        uint32_t num_blocks_in_group = min(group_span, primary_num_blocks - first_block_idx);
 
         // Convert to final M/N block indices
         if constexpr (kIsTMAMulticastOnA) {
@@ -129,6 +271,25 @@ struct DeepGemmScheduler {
         } else {
             m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
             n_block_idx = in_group_idx / num_blocks_in_group;
+        }
+
+        if constexpr (kIsMegaMoE && kNum1DBlocksPerGroup >= 16) {
+            // Keep the mapping bijective for any expert size, while sending
+            // adjacent persistent CTAs to distant M blocks. A hot expert's
+            // source-rank runs are contiguous, so this spreads peer writes.
+            if (num_m_blocks >= kNum1DBlocksPerGroup) {
+                const uint32_t bits = 32u - __clz(num_m_blocks - 1u);
+                // When three quarters of a power-of-two domain is occupied,
+                // skip the input indices whose reversed values are out of
+                // range. Otherwise the fallback leaves every fourth block
+                // unmoved and biases the earliest CTA wave.
+                const uint32_t input =
+                    bits >= 2 && num_m_blocks == (3u << (bits - 2))
+                    ? m_block_idx + m_block_idx / 3u : m_block_idx;
+                const uint32_t permuted = __brev(input) >> (32u - bits);
+                if (permuted < num_m_blocks)
+                    m_block_idx = permuted;
+            }
         }
     }
 
@@ -141,14 +302,46 @@ struct DeepGemmScheduler {
         } else if (kGemmType == GemmType::GroupedContiguous) {
             auto offset = kIgnoreGroupedForGroupedContiguous ? 0 : __ldg(params.grouped_layout + m_block_idx * BLOCK_M);
             return offset * shape_dim + block_idx * block_size;
-        } else if (kGemmType == GemmType::GroupedMasked) {
+        } else if (kIsMaskedLayout) {
             return curr_group_idx * shape_dim + block_idx * block_size;
         }
     }
 
     CUTLASS_DEVICE bool fetch_next_work(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
-        if constexpr(kIsNoPadPreprocessLayout) {
+        uint32_t next_block_idx;
+        {
+            uint32_t eff_grid = gridDim.x;
+            uint32_t eff_bidx = blockIdx.x;
+            if constexpr (kIsFusedDispatch && kNumCopyBlocks > 0) {
+                eff_grid = gridDim.x - kNumCopyBlocks;
+                eff_bidx = blockIdx.x - kNumCopyBlocks;
+            }
+            next_block_idx = (current_iter++) * eff_grid + eff_bidx;
+        }
+        if constexpr(kIsFusedDispatch) {
+            if (next_block_idx >= num_blocks) {
+                m_block_idx = num_aligned_m_blocks;
+                n_block_idx = kNumNBlocks;
+                return false;
+            }
+
+            // grouped_layout[0] stores the total M-block count and each
+            // following uint4 is {expert, expert_m, expert_base_block,
+            // expert_base_m}. This is the same metadata consumed by the copy
+            // CTAs, so the mapping is exact for both single- and multi-M-block
+            // experts and avoids the masked scheduler's prefix scan.
+            const uint32_t global_m_block = next_block_idx / kNumNBlocks;
+            const uint4 data =
+                (reinterpret_cast<const uint4*>(
+                    params.copy_grouped_layout) + 1)[global_m_block];
+            curr_group_idx = data.x;
+            curr_group_m = data.y;
+            curr_cumsum_m = data.w;
+            curr_global_block_m_idx = global_m_block;
+            m_block_idx = global_m_block - data.z;
+            n_block_idx =
+                next_block_idx - global_m_block * kNumNBlocks;
+        } else if constexpr(kIsNoPadPreprocessLayout) {
             if (next_block_idx >= num_blocks) {
                 m_block_idx = num_aligned_m_blocks;
                 n_block_idx = kNumNBlocks;
@@ -166,12 +359,12 @@ struct DeepGemmScheduler {
             } else {
                 curr_cumsum_m = data.w;
             }
-        } else if constexpr(kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedFused) {
+        } else if constexpr(kIsMaskedLayout || kIsNoPadLayout || kGemmType == GemmType::GroupedFused) {
             uint32_t num_m_blocks;
             while (true) {
                 // End of the task
                 if (curr_group_idx == kNumGroups) {
-                    m_block_idx = num_m_blocks;
+                    m_block_idx = num_aligned_m_blocks;
                     n_block_idx = kNumNBlocks;
                     return false;
                 }
@@ -224,7 +417,13 @@ struct DeepGemmScheduler {
 
     template<bool kEnableNExpand = true>
     CUTLASS_DEVICE bool fetch_next_work_dynamic_tile(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        const auto next_block_idx = (current_iter++) * gridDim.x + blockIdx.x;
+        uint32_t eff_grid = gridDim.x;
+        uint32_t eff_bidx = blockIdx.x;
+        if constexpr (kIsFusedDispatch && kNumCopyBlocks > 0) {
+            eff_grid = gridDim.x - kNumCopyBlocks;
+            eff_bidx = blockIdx.x - kNumCopyBlocks;
+        }
+        const auto next_block_idx = (current_iter++) * eff_grid + eff_bidx;
         if (kIsNoPadPreprocessLayout) {
             if (next_block_idx >= num_blocks) {
                 m_block_idx = num_aligned_m_blocks;
@@ -239,7 +438,7 @@ struct DeepGemmScheduler {
             uint32_t num_m_blocks = ceil_div(curr_group_m, BLOCK_M);
             curr_cumsum_m = data.w;
             get_swizzled_block_idx(num_m_blocks, block_idx_in_m, m_block_idx, n_block_idx);
-        } else if (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedNoPad) {
+        } else if (kIsMaskedLayout || kIsNoPadLayout) {
             uint32_t num_m_blocks;
             int n_expand = 1;
             int curr_cumsum_blocks_prev;
@@ -303,7 +502,9 @@ struct DeepGemmScheduler {
 
         // dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape_mnkl, tile_shape, cluster_shape);
         auto problem_shape = cutlass::gemm::to_gemm_coord(problem_shape_mnkl);
-        Params params(problem_shape.m(), groups_layout);
+        Params params = arguments;
+        params.grouped_layout = groups_layout;
+        params.shape_m = static_cast<uint32_t>(problem_shape.m());
         return params;
     }
 
@@ -322,9 +523,9 @@ struct DeepGemmScheduler {
     {
         if constexpr (kGemmType == GemmType::DenseGemm || kGemmType == GemmType::BatchGemm || kGemmType == GemmType::GroupedContiguous) {
             return params.shape_m;
-        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
+        } else if constexpr (kIsMaskedLayout) {
             return curr_group_m;
-        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+        } else if constexpr (kIsNoPadLayout) {
             return curr_group_m;
         } else {
             return 0;
@@ -340,9 +541,11 @@ struct DeepGemmScheduler {
     // Gets the pointer offset of matrix A
     __device__ __forceinline__ int64_t curr_offset_a() const
     {
-        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::BatchGemm) {
+        if constexpr (kIsFusedDispatch) {
+            return int64_t(curr_cumsum_m) * SHAPE_K;
+        } else if constexpr (kIsMaskedLayout || kGemmType == GemmType::BatchGemm) {
             return int64_t(curr_group_idx) * params.shape_m * SHAPE_K;
-        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+        } else if constexpr (kIsNoPadLayout) {
             return int64_t(curr_cumsum_m) * SHAPE_K;
         } else {
             return 0;
@@ -351,9 +554,11 @@ struct DeepGemmScheduler {
 
     __device__ __forceinline__ int64_t curr_offset_scalea() const
     {
-        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::BatchGemm) {
+        if constexpr (kIsFusedDispatch) {
+            return int64_t(curr_cumsum_m) * SHAPE_K / 128;
+        } else if constexpr (kIsMaskedLayout || kGemmType == GemmType::BatchGemm) {
             return int64_t(curr_group_idx) * params.shape_m * SHAPE_K / 128;
-        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+        } else if constexpr (kIsNoPadLayout) {
             return int64_t(curr_cumsum_m);
         } else {
             return 0;
@@ -365,10 +570,11 @@ struct DeepGemmScheduler {
     {
         // scales are organized in uint16_t
         uint32_t shape_k_scale = ceil_div(SHAPE_K, (uint32_t)32);
-        if constexpr (kGemmType == GemmType::GroupedNoPad) {
+        if constexpr (kIsFusedDispatch ||
+                      kIsNoPadLayout) {
             // /4 means uint8_t to uint32_t;
             return int64_t(curr_cumsum_m);
-        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
+        } else if constexpr (kIsMaskedLayout) {
             return int64_t(curr_group_idx) * params.shape_m * shape_k_scale;
         } else {
             return 0;
@@ -378,9 +584,11 @@ struct DeepGemmScheduler {
     /// Gets the pointer offset of matrix A
     __device__ __forceinline__ int64_t curr_offset_m() const
     {
-        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::BatchGemm) {
+        if constexpr (kIsFusedDispatch) {
+            return curr_cumsum_m;
+        } else if constexpr (kIsMaskedLayout || kGemmType == GemmType::BatchGemm) {
             return int64_t(curr_group_idx) * params.shape_m;
-        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+        } else if constexpr (kIsNoPadLayout) {
             return curr_cumsum_m;
         } else {
             return 0;
@@ -410,7 +618,7 @@ struct DeepGemmScheduler {
     // Gets the pointer offset of matrix C
     __device__ __forceinline__ int64_t curr_offset_mxfp4_c() const
     {
-        if constexpr (kGemmType == GemmType::GroupedNoPad || kGemmType == GemmType::GroupedMasked) {
+        if constexpr (kIsNoPadLayout || kIsMaskedLayout) {
             return int64_t(curr_group_idx) * SHAPE_N;
         } else {
             return 0;
@@ -419,9 +627,11 @@ struct DeepGemmScheduler {
 
     __device__ __forceinline__ int64_t curr_offset_c() const
     {
-        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
+        if constexpr (kIsFusedDispatch) {
+            return int64_t(curr_cumsum_m) * SHAPE_N_OUT;
+        } else if constexpr (kIsMaskedLayout || kGemmType == GemmType::GroupedContiguous) {
             return int64_t(curr_group_idx) * params.shape_m * SHAPE_N_OUT;
-        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+        } else if constexpr (kIsNoPadLayout) {
             return int64_t(curr_cumsum_m) * SHAPE_N_OUT;
         } else if constexpr(kGemmType == GemmType::BatchGemm) {
             // Transposed `[M, B, N]`: a batch only advances by one row segment, and the row
@@ -437,15 +647,18 @@ struct DeepGemmScheduler {
         }
     }
 
-    // curr_offset_c_scales is only for epilogue fusing(gemm1 + silu_and_mul + downcast_to_mxfp4)
+    // Scale output offset for the fused silu-and-mul + MXFP4 epilogue.
     __device__ __forceinline__ int64_t curr_offset_c_scales() const
     {
-        // scale is M/N-Major(uint16)
-        constexpr uint32_t SFC_SHAPE_N = EpilogueTraits<kEpilogueType>::get_shape_sfn_out(SHAPE_N);
+        constexpr uint32_t SFC_SHAPE_N =
+            EpilogueTraits<kEpilogueType>::get_shape_sfn_out(SHAPE_N);
 
-        if constexpr (kGemmType == GemmType::GroupedMasked || kGemmType == GemmType::GroupedContiguous) {
+        if constexpr (kIsFusedDispatch) {
+            return int64_t(curr_cumsum_m);
+        } else if constexpr (kIsMaskedLayout ||
+                      kGemmType == GemmType::GroupedContiguous) {
             return int64_t(curr_group_idx) * params.shape_m * SFC_SHAPE_N;
-        } else if constexpr (kGemmType == GemmType::GroupedNoPad) {
+        } else if constexpr (kIsNoPadLayout) {
             return int64_t(curr_cumsum_m);
         } else {
             return 0;
@@ -577,4 +790,3 @@ struct DynamicTileScheduler
 #pragma clang diagnostic pop
 
 }
-

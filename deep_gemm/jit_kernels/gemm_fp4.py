@@ -291,7 +291,8 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
                      enable_act_and_quant_fusing: bool,
                      gemm_type: GemmType=GemmType.DenseGemm,
                      max_block_n: int = 256,
-                     min_block_n: int = 32) -> \
+                     min_block_n: int = 32,
+                     min_block_m: int = 16) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     assert is_ppu1v5_device(), "mxfp4 is only supported on PPU-ZW890"
 
@@ -308,6 +309,9 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
         return get_best_configs_dense_ppu1v5(m, n, k, num_groups, num_sms, has_bias, enable_act_and_quant_fusing)
 
     block_ms = (256, 128, 64, 32, 16) if k > 768 else (128, 64, 32, 16)
+    assert min_block_m in (16, 32, 64, 128, 256)
+    block_ms = tuple(bm for bm in block_ms if bm >= min_block_m)
+    assert block_ms
     # block_ns = (256, 128, 64, 32)
     assert max_block_n > 0 and (max_block_n & (max_block_n - 1)) == 0
     assert min_block_n > 0 and (min_block_n & (min_block_n - 1)) == 0
@@ -471,6 +475,9 @@ def get_best_configs(total_m: int, m: int, n: int, k: int, num_groups: int, num_
                     best_block_n = 128
         elif (m >= 6) and (best_block_m in [32, 64] and best_block_n == 256):
             best_block_m, best_block_n, block_k = 128, 256, 64
+    # Specialized epilogues may require stricter bounds than small-M recipes.
+    best_block_m = max(best_block_m, min_block_m)
+    best_block_n = max(best_block_n, min_block_n)
     tile_config = tile_config_normal
     if (k < 128) and not (best_block_n >= 128 and best_block_m >= 128):
         tile_config = tile_config_smallK

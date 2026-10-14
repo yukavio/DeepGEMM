@@ -9,6 +9,14 @@ from . import jit
 from . import deep_gemm_tuner
 from . import deep_gemm_cpp
 
+from .mega import (
+    SymmBuffer,
+    get_symm_buffer_for_mega_moe,
+    transform_weights_for_mega_moe,
+    fp4_fp4_mega_moe,
+    mega_moe_pre_dispatch,
+)
+
 # Configs
 from .deep_gemm_cpp import (
     set_num_sms,

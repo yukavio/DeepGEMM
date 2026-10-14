@@ -37,7 +37,9 @@
 #include <deep_gemm/impls/fp4_gemm_cutlass3_dynamic.cuh>
 #include <deep_gemm/mma/fp4_mma.cuh>
 #include <deep_gemm/epilogue/fp4_epilogue_silu_and_mul_post_quant.cuh>
-
+#include <deep_gemm/fused_dispatch.cuh>
+#include <deep_gemm/fp4_scatter_barrier.cuh>
+#include <deep_gemm/fp4_scatter_epilogue.cuh>
 #include <math.h>
 
 using namespace cute;
@@ -85,6 +87,9 @@ class DeepGemmUniversal <
   static_assert(rank(ProblemShape{}) == 3 or rank(ProblemShape{}) == 4,
     "ProblemShape{} should be <M,N,K> or <M,N,K,L>");
   static_assert(kEpilogueType == EpilogueType::Default, "NExpand mode only supports EpilogueType::Default because TSM overlap in the Epilogue");
+  static_assert(!TileScheduler_::kIsFusedDispatch &&
+                !deep_gemm::epilogue::Fp4ScatterTraits<CollectiveEpilogue_>::enabled,
+                "Fused dispatch and FP4 scatter require the nExpand == 1 specialization");
 
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
@@ -311,7 +316,7 @@ class DeepGemmUniversal <
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
     }
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+    if constexpr (TileScheduler::kIsNoPadLayout) {
       // each warp prefetch one cacheline
       if (warp_idx < N_PREFETCH_CACHELINE) {
         __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout + (warp_idx << 5)));
@@ -670,6 +675,12 @@ class DeepGemmUniversal <
   kEpilogueType
 > {
 public:
+  using ScatterTraits = deep_gemm::epilogue::Fp4ScatterTraits<CollectiveEpilogue_>;
+  static constexpr bool kEnableScatter = TileScheduler_::kIsMegaMoE && ScatterTraits::enabled;
+  static_assert(ScatterTraits::enabled ==
+                    (TileScheduler_::kIsMegaMoE && !TileScheduler_::kIsFusedDispatch),
+                "FP4 scatter is the MegaMoE Stage2 epilogue");
+  static constexpr int kWorldSize = ScatterTraits::world_size;
   //
   // Type Aliases
   //
@@ -736,6 +747,7 @@ public:
 
   // MSVC requires the cast to fix a warning-as-error.
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
+  static constexpr int BlockM = cute::size<0>(TileShape{});
 
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
   static constexpr uint32_t N_PREFETCH_CACHELINE = cute::ceil_div(TileScheduler::kNumGroups, 32);   // numGroups * sizeof(int) / 128 Byte = cacheline
@@ -754,6 +766,8 @@ public:
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
     int32_t* signal{nullptr};
+    deep_gemm::epilogue::Fp4ScatterBuffer<kWorldSize> scatter_buffer{};
+    deep_gemm::comm::Fp4ScatterBarrierWorkspace* scatter_barrier{nullptr};
 #if SAIL_SYNC_IN_CE
     int *ptr_sync_ce = nullptr;
 #endif
@@ -773,7 +787,9 @@ public:
   };
 
   // Kernel entry point API
-  struct Params {
+  // Keep the non-scatter layout identical to the native C++ launcher's Params
+  // mirror. Scatter state must not shift ptr_sync_ce or extend that argument.
+  struct ParamsBase {
     GemmUniversalMode mode{};
     ProblemShape problem_shape{};
     MainloopParams mainloop{};
@@ -786,6 +802,13 @@ public:
     int *ptr_sync_ce = nullptr;
 #endif
   };
+
+  struct ScatterParams : ParamsBase {
+    deep_gemm::epilogue::Fp4ScatterBuffer<kWorldSize> scatter_buffer{};
+    deep_gemm::comm::Fp4ScatterBarrierWorkspace* scatter_barrier{nullptr};
+  };
+  using Params = typename cutlass::platform::conditional<
+      kEnableScatter, ScatterParams, ParamsBase>::type;
 
   //
   // Methods
@@ -822,7 +845,7 @@ public:
     TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(grouped_layout,
       problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
 
-    return {
+    ParamsBase params{
       args.mode,
       args.problem_shape,
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
@@ -832,6 +855,11 @@ public:
       workspace,
       args.signal
     };
+    if constexpr (kEnableScatter) {
+      return {params, args.scatter_buffer, args.scatter_barrier};
+    } else {
+      return params;
+    }
   }
 
   static bool
@@ -884,14 +912,58 @@ public:
     using namespace cute;
     using X = Underscore;
 
+    uint32_t round_generation = 0;
+    if constexpr (TileScheduler::kIsFusedDispatch) {
+      static_assert(TileScheduler::kNumGroups * (TileScheduler::kNumRanks + 4) *
+                        sizeof(uint32_t) <= SharedStorageSize,
+                    "dispatch preprocess must fit the GEMM shared allocation");
+      round_generation =
+          resolve_fused_round_generation(params.scheduler);
+      run_rank_generic_device_preprocess_role<
+          TileScheduler, BlockM, MaxThreadsPerBlock>(
+          params.scheduler, smem_buf, round_generation);
+    }
+
+    run_after_prepare(params, smem_buf, round_generation);
+  }
+
+  CUTLASS_DEVICE
+  void run_after_prepare(Params const& params, char* smem_buf,
+                         uint32_t round_generation) {
+    using namespace cute;
+    using X = Underscore;
+
+    // FusedDispatch: copy blocks do P2P copy then exit
+    if constexpr (TileScheduler::kIsFusedDispatch && TileScheduler::kNumCopyBlocks > 0) {
+      if (blockIdx.x < TileScheduler::kNumCopyBlocks) {
+        static_assert(
+            sizeof(CopyRankMetadataShared<BlockM,
+                                          TileScheduler::kNumRanks>) <=
+                SharedStorageSize,
+            "copy rank metadata must fit the existing GEMM shared allocation");
+        uint32_t total_m_blocks = params.scheduler.copy_grouped_layout[0];
+        run_copy_block<BlockM, TileScheduler::kNumRanks,
+            TileScheduler::kNumGroups,
+            cute::size<2>(TileShape{}), TileScheduler::kKTilesPerFlag,
+            TileScheduler::SHAPE_K, MaxThreadsPerBlock,
+            TileScheduler::kSourceCapacity>(
+            params.scheduler, total_m_blocks, smem_buf,
+            round_generation);
+        return;
+      }
+    }
+
     // Preconditions
     CUTE_STATIC_ASSERT(is_static<TileShape>::value);
 
     if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedMasked) {
       // group is small 8|16, just prefetch one cacheline
       __ppu_prefetch_KSD((void*)(params.scheduler.grouped_layout));
+    } else if constexpr (TileScheduler::kIsFusedDispatch) {
+      // Fused scheduling consumes the block-granular copy layout.
+      __ppu_prefetch_KSD((void*)(params.scheduler.copy_grouped_layout));
     }
-    if constexpr (TileScheduler::GEMM_TYPE == GemmType::GroupedNoPad) {
+    if constexpr (TileScheduler::kIsNoPadLayout) {
       // each warp prefetch one cacheline
       int warp_idx = cutlass::canonical_warp_idx_sync();
       if (warp_idx < N_PREFETCH_CACHELINE) {
@@ -922,6 +994,19 @@ public:
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{};                                                                // (BLK_M,BLK_N,BLK_K)
 
+    // Hoist loop-invariant FusedDispatch values before LICM-disabled loop
+    constexpr uint32_t fd_k_half = TileScheduler::SHAPE_K;
+    constexpr uint32_t fd_sfa_ksb =
+        (TileScheduler::SHAPE_K + 31u) / 32u;
+    uint8_t* fd_fp4_buf;
+    uint16_t* fd_sfa_buf;
+    volatile uint32_t* fd_copy_flags;
+    if constexpr (TileScheduler::kIsFusedDispatch) {
+        fd_fp4_buf = params.scheduler.local_fp4_buf;
+        fd_sfa_buf = params.scheduler.local_sfa_buf;
+        fd_copy_flags = params.scheduler.copy_ready_flags;
+    }
+
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
@@ -933,21 +1018,51 @@ public:
 
       auto problem_shape_MNKL = ProblemShape{M, N, K, L};
 
-      auto offset_a = deep_scheduler.curr_offset_a();
+      const ElementA* ptr_A;
+      const ElementSFA* ptr_scale_A;
+      uint32_t expert_local = 0;
+      if constexpr (TileScheduler::kIsFusedDispatch) {
+          expert_local = deep_scheduler.problem_index();
+          const uint64_t base_m = deep_scheduler.curr_cumsum_m;
+          ptr_A = reinterpret_cast<const ElementA*>(
+              fd_fp4_buf + base_m * fd_k_half);
+          ptr_scale_A = reinterpret_cast<const ElementSFA*>(
+              fd_sfa_buf + base_m * fd_sfa_ksb);
+      } else {
+          auto offset_a = deep_scheduler.curr_offset_a();
+          auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
+          ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
+          ptr_scale_A = reinterpret_cast<const ElementSFA*>(params.mainloop.ptr_scale_A) + offset_scalea;
+      }
       auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
-      auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
       auto offset_scaleb = deep_scheduler.curr_offset_mxfp4_scaleb(m_block_idx);
-      const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
-      const ElementSFA* ptr_scale_A = reinterpret_cast<const ElementSFA*>(params.mainloop.ptr_scale_A) + offset_scalea;
       const ElementSFB* ptr_scale_B = reinterpret_cast<const ElementSFB*>(params.mainloop.ptr_scale_B) + offset_scaleb;
 
       auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
       // update actual global ptr offset
-      MainloopParams update_params = {
-        {M, N, K}, ptr_A, params.mainloop.dA, ptr_B, params.mainloop.dB,
-        ptr_scale_A, params.mainloop.dSFA, ptr_scale_B, params.mainloop.dSFB
-      };
+      auto dSFA_local = params.mainloop.dSFA;
+      if constexpr (TileScheduler::kIsFusedDispatch) {
+          get<1>(dSFA_local) = static_cast<int64_t>(M);
+      }
+      MainloopParams update_params{};
+      update_params.problem_shape = {M, N, K};
+      update_params.ptr_A = ptr_A;
+      update_params.dA = params.mainloop.dA;
+      update_params.ptr_B = ptr_B;
+      update_params.dB = params.mainloop.dB;
+      update_params.ptr_scale_A = ptr_scale_A;
+      update_params.dSFA = dSFA_local;
+      update_params.ptr_scale_B = ptr_scale_B;
+      update_params.dSFB = params.mainloop.dSFB;
+      if constexpr (TileScheduler::kIsFusedDispatch) {
+        update_params.copy_ready_flags = fd_copy_flags + deep_scheduler.curr_global_block_m_idx;
+        update_params.copy_ready_generation = round_generation;
+        update_params.copy_k_tiles_per_flag = TileScheduler::kKTilesPerFlag;
+        update_params.sfa_ready_flags = params.scheduler.preprocess_ready_flags + 1 +
+            expert_local * FusedSfaPartitionLayout::kNumPartitions;
+        update_params.sfa_ready_generation = round_generation;
+      }
       CollectiveMainloop collective_mma(update_params, problem_shape_MNKL);
       auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, update_params);
 
@@ -982,25 +1097,49 @@ public:
 
       // Update the pointer to C and D of MXFP4 in the epilogue parameters
       auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
-      if constexpr (hasBias_) {
+      if constexpr (!kEnableScatter) {
+        params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
+      }
+      if constexpr (hasBias_ && !kEnableScatter) {
         params_epilogue_local.ptr_Bias += deep_scheduler.curr_offset_mxfp4_c();
       }
       if constexpr (EpilogueTraits<kEpilogueType>::needs_sfd_offset) {
         params_epilogue_local.ptr_SFD += deep_scheduler.curr_offset_c_scales();
       }
-      // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
-      epilogue(
-        problem_shape_MNKL,
-        blk_shape,
-        blk_coord_mnkl,
-        accumulators,
-        tiled_mma,
-        residue_mnk,
-        thread_idx,
-        (char*)&shared_storage.tensors.epilogue
-      );
+      if constexpr (kEnableScatter) {
+        epilogue(
+          problem_shape_MNKL,
+          blk_shape,
+          blk_coord_mnkl,
+          accumulators,
+          tiled_mma,
+          residue_mnk,
+          thread_idx,
+          (char*)&shared_storage.tensors.epilogue,
+          static_cast<uint32_t>(deep_scheduler.problem_index()),
+          static_cast<uint32_t>(deep_scheduler.curr_offset_m()),
+          params.scatter_buffer
+        );
+      } else {
+        epilogue(
+          problem_shape_MNKL,
+          blk_shape,
+          blk_coord_mnkl,
+          accumulators,
+          tiled_mma,
+          residue_mnk,
+          thread_idx,
+          (char*)&shared_storage.tensors.epilogue
+        );
+      }
+    }
+
+    if constexpr (kEnableScatter) {
+      deep_gemm::comm::fp4_scatter_release<kWorldSize>(
+          *params.scatter_barrier,
+          params.scatter_buffer,
+          gridDim.x, blockIdx.x, threadIdx.x);
     }
   }
 };

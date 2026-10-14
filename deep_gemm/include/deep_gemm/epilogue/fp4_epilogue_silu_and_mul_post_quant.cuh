@@ -237,11 +237,19 @@ public:
 
     static constexpr int MMA_M = decltype(size<1>(shape<0>(accumulators)))::value;
     static constexpr int MMA_N = decltype(size<2>(shape<0>(accumulators)))::value;
+    // Each activation step covers 16 M rows per warp.
+    constexpr int act_rows_per_warp_m = act_layout_stride_warp_m / act_layout_stride_thread_m;
+    constexpr int act_rows_per_warp_iter_m = act_layout_stride_warp_iter_m / act_layout_stride_thread_m;
     int warp_base_offset = warp_m_idx * act_layout_stride_warp_m + (lane_idx / 4) * act_layout_stride_thread_m + warp_n_idx * act_layout_stride_warp_n + (lane_idx % 4); // * act_layout_stride_thread_n=1
     auto smem_act_tensor_ptr_per_lane = smem_act_tensor_ptr + warp_base_offset;
     cutlass::epilogue::thread::Sigmoid<ElementAccumulator> sigmoid_accumulator;
     multiplies<ElementAccumulator> mul_accumulator;
+    // All lanes in a warp share this M boundary.
+    const int act_rows_left = get<0>(residue_mnk) - warp_m_idx * act_rows_per_warp_m;
     cute::for_each(make_int_sequence<WARP_ITER_M_NUM>{}, [&](auto warp_iter_m) {
+      // Skip 16-row steps beyond M; the quant loop reads only valid rows.
+      constexpr int act_row_offset = warp_iter_m * act_rows_per_warp_iter_m;
+      if (act_row_offset >= act_rows_left) return;
       cute::for_each(make_int_sequence<MMA_M>{}, [&](auto mma_m) {
         // unroll inner loops manually to mitigate compute deps
         ElementAccumulator sigmoid_accums[WARP_ITER_N_NUM][MMA_N];

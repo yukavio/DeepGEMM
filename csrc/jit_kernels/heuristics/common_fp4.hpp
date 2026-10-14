@@ -409,7 +409,7 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
                               bool has_bias,
                               bool enable_act_and_quant_fusing,
                               GemmType gemm_type = GemmType::DenseGemm,
-                              int max_block_n = 256, int min_block_n = 32) {
+                              int max_block_n = 256, int min_block_n = 32, int min_block_m = 16) {
     // C++ layer does not perform device checking; is_ppu1v5_device() assert skipped
     (void)total_m;
 
@@ -429,6 +429,11 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
     }
 
     std::vector<int> block_ms = (k > 768) ? std::vector<int>{256, 128, 64, 32, 16} : std::vector<int>{128, 64, 32, 16};
+    DG_HOST_ASSERT(min_block_m == 16 || min_block_m == 32 || min_block_m == 64 ||
+                   min_block_m == 128 || min_block_m == 256);
+    block_ms.erase(std::remove_if(block_ms.begin(), block_ms.end(),
+                                 [=](int bm) { return bm < min_block_m; }), block_ms.end());
+    DG_HOST_ASSERT(!block_ms.empty());
 
     DG_HOST_ASSERT(max_block_n > 0 && (max_block_n & (max_block_n - 1)) == 0);
     DG_HOST_ASSERT(min_block_n > 0 && (min_block_n & (min_block_n - 1)) == 0);
@@ -636,6 +641,9 @@ ConfigResult get_best_configs(int total_m, int m, int n, int k, int num_groups, 
         }
     }
 
+    // Specialized epilogues must retain their bounds after small-M recipes.
+    best_block_m = std::max(best_block_m, min_block_m);
+    best_block_n = std::max(best_block_n, min_block_n);
     const TileConfig& tile_config =
         (k < 128 && !(best_block_n >= 128 && best_block_m >= 128)) ? get_tile_config_smallK() : get_tile_config_normal();
 

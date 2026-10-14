@@ -142,14 +142,15 @@ public:
                       sizeof(EpilogueArgsNoTsm) + sizeof(uint16_t*) + sizeof(uint32_t) + sizeof(float),
                   "fused epilogue params must be the NoTsm layout plus ptr_SFD/shape_m/swiglu_limit");
 
-    template <typename EpilogueArgsT>
+    template <typename EpilogueArgsT, typename MainloopArgsT = MainLoopArguments,
+              typename SchedulerArgsT = TileSchedulerArguments>
     struct GemmKernelParamsT {
         GemmUniversalMode mode;
         GemmProblemSize problem_shape;
-        MainLoopArguments collective_mainloop_params;
+        MainloopArgsT collective_mainloop_params;
         EpilogueArgsT collective_epilogue_params;
         cutlass::KernelHardwareInfo hw_info;
-        TileSchedulerArguments scheduler;
+        SchedulerArgsT scheduler;
         void* workspace{nullptr};
         int32_t* signal{nullptr};
         // actlize_v1.0.0 sets SAIL_SYNC_IN_CE=1 (accutlass.hpp), which appends this field to the

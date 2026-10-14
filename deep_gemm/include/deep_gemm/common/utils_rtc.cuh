@@ -10,9 +10,15 @@ enum class GemmType {
     GroupedNoPad,
     GroupedFused,
     BatchGemm,
+    MegaMoE,
 };
 
-const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "GroupedNoPad", "GroupedFused", "BatchGemm"};
+enum class MegaMoEStage {
+    Linear1,
+    Linear2,
+};
+
+const char* GemmTypeS[] = { "DenseGemm", "GroupedContiguous", "GroupedMasked", "GroupedNoPad", "GroupedFused", "BatchGemm", "MegaMoE"};
 
 enum class FP4DynamicTileId : int {
     Disabled  = -1,
