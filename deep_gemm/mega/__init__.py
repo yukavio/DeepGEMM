@@ -6,7 +6,7 @@ import weakref
 import warnings
 import types
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 # noinspection PyBroadException
@@ -340,6 +340,7 @@ def fp4_fp4_mega_moe(
     expected_m: Optional[int] = None,  # Extra scheduling-hint override; absent upstream.
     preserve_bf16: bool = False,
     fuse_reduce: bool = False,
+    after_gemm1: Optional[Callable[[], None]] = None,
 ) -> None:
     """Consume published buffers through the complete C++ MegaMoE entry.
 
@@ -352,12 +353,20 @@ def fp4_fp4_mega_moe(
     its FP32 scale arithmetic inside the fused epilogue, without a BF16 store.
     fuse_reduce performs the ordered weighted reduction after GEMM2's peer
     completion barrier in the same kernel, removing the separate reduce launch.
+    after_gemm1, when provided, runs on the submitting host thread after G1
+    is enqueued and before G2 is enqueued. It does not synchronize the device.
+    It may enqueue independent work on another stream; that stream must wait
+    on the current stream before consuming G1 results and be joined by its
+    owner. During Graph replay only captured device work runs, not the Python
+    callback. Warm and capture with the same callback and retain its storage.
     cumulative_local_expert_recv_stats is a reserved CUDA int32 vector with
     one entry per local expert. It is forwarded to the C++ JIT implementation
     for API alignment; this backend does not update the counters yet.
     Callers must retain weights and the optional statistics tensor until GPU
     execution completes, including every replay of a captured Graph.
     """
+    if after_gemm1 is not None and not callable(after_gemm1):
+        raise TypeError('after_gemm1 must be callable')
     if not isinstance(sym_buffer, SymmBuffer):
         raise ValueError('Main MegaMoE requires a SymmBuffer')
     published_inputs = sym_buffer._state.input_keepalive
@@ -372,4 +381,4 @@ def fp4_fp4_mega_moe(
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         tuple(recipe), activation, activation_clamp, fast_math,
         expected_m, preserve_bf16, fuse_reduce,
-        getattr(sym_buffer, "_stage1_done", None))
+        after_gemm1 if after_gemm1 is not None else getattr(sym_buffer, "_stage1_done", None))
