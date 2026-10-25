@@ -160,10 +160,10 @@ class SymmBuffer:
                 f"got {num_tokens}")
         if (not isinstance(topk_ids, torch.Tensor)
                 or topk_ids.shape != (num_tokens, self.num_topk)
-                or topk_ids.dtype != torch.int32
+                or topk_ids.dtype not in (torch.int32, torch.int64)
                 or not topk_ids.is_contiguous()):
             raise ValueError(
-                "topk_ids must be contiguous int32 with shape "
+                "topk_ids must be contiguous int32/int64 with shape "
                 f"({num_tokens}, {self.num_topk})")
         if (not isinstance(topk_weights, torch.Tensor)
                 or topk_weights.shape != topk_ids.shape
@@ -175,14 +175,20 @@ class SymmBuffer:
                for t in (hidden_states, topk_ids, topk_weights)):
             raise ValueError("activations and routing must be on the buffer device")
 
-def _publish_mega_moe(sym_buffer, hidden_states, topk_ids, topk_weights):
+def _publish_mega_moe(sym_buffer, hidden_states, topk_ids, topk_weights, active_token_mask=None):
     sym_buffer._validate_inputs(hidden_states, topk_ids, topk_weights)
+    if active_token_mask is not None and (
+            active_token_mask.shape != (hidden_states.shape[0],)
+            or active_token_mask.dtype != torch.bool
+            or active_token_mask.device != hidden_states.device
+            or not active_token_mask.is_contiguous()):
+        raise ValueError("active_token_mask must be one contiguous device bool per token")
     _C._mega_moe_quant(
         hidden_states, topk_ids, topk_weights, sym_buffer.buffer, sym_buffer.handle.buffer_ptrs,
         sym_buffer.group.size(), sym_buffer.num_experts,
         sym_buffer.num_max_tokens_per_rank, sym_buffer.group.rank(),
-        sym_buffer.intermediate_hidden)
-    sym_buffer._state.input_keepalive = (hidden_states, topk_ids, topk_weights)
+        sym_buffer.intermediate_hidden, active_token_mask)
+    sym_buffer._state.input_keepalive = (hidden_states, topk_ids, topk_weights, active_token_mask)
     # Zero-row ranks still publish their empty route counts to every peer.
 
 
@@ -276,12 +282,15 @@ def mega_moe_pre_dispatch(
     num_tokens: Optional[int] = None,
     group_size: int = 32,
     use_fp4_acts: bool = True,
+    active_token_mask: Optional[torch.Tensor] = None,
 ) -> None:
     """Publish MXFP4 inputs to a SymmBuffer without an intermediate copy.
 
     Existing SGLang callers may pass its four exact output views instead of
     sym_buffer. Valid expert IDs in each token row must be unique; invalid
-    IDs are masked by the device publication kernel.
+    IDs are masked by the device publication kernel. Int32 and int64 route
+    inputs are accepted; active_token_mask can suppress rows without a separate
+    packing kernel. The buffer keeps the mask alive through Graph replay.
     """
     if group_size != 32 or not use_fp4_acts:
         raise ValueError("PPU MegaMoE requires MXFP4 with group_size=32")
@@ -310,7 +319,8 @@ def mega_moe_pre_dispatch(
         raise ValueError("topk_ids and topk_weights must be 2D tensors")
     _publish_mega_moe(
         buffer, hidden_states[:num_tokens], topk_ids[:num_tokens],
-        topk_weights[:num_tokens])
+        topk_weights[:num_tokens],
+        active_token_mask[:num_tokens] if active_token_mask is not None else None)
 
 
 # TODO: review API alignment with upstream fp8_fp4_mega_moe and SGLang callers.
@@ -328,6 +338,8 @@ def fp4_fp4_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     expected_m: Optional[int] = None,  # Extra scheduling-hint override; absent upstream.
+    preserve_bf16: bool = False,
+    fuse_reduce: bool = False,
 ) -> None:
     """Consume published buffers through the complete C++ MegaMoE entry.
 
@@ -336,6 +348,10 @@ def fp4_fp4_mega_moe(
     any remaining rows are left untouched.
     None or +inf disables activation clamping.
     expected_m optionally overrides the shape-only scheduling hint for tests.
+    preserve_bf16 preserves the standalone BF16 GEMM1/activation boundary and
+    its FP32 scale arithmetic inside the fused epilogue, without a BF16 store.
+    fuse_reduce performs the ordered weighted reduction after GEMM2's peer
+    completion barrier in the same kernel, removing the separate reduce launch.
     cumulative_local_expert_recv_stats is a reserved CUDA int32 vector with
     one entry per local expert. It is forwarded to the C++ JIT implementation
     for API alignment; this backend does not update the counters yet.
@@ -355,5 +371,5 @@ def fp4_fp4_mega_moe(
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         tuple(recipe), activation, activation_clamp, fast_math,
-        expected_m,
+        expected_m, preserve_bf16, fuse_reduce,
         getattr(sym_buffer, "_stage1_done", None))

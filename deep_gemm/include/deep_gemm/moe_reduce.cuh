@@ -7,14 +7,15 @@
 
 constexpr int kMoeReduceThreads = 512;
 
-template <bool kCheckInvalid, int kTopK, int kHidden>
+template <bool kCheckInvalid, int kTopK, int kHidden, int kThreads = kMoeReduceThreads,
+          bool kBulkScatter = true>
 __device__ __forceinline__ void moe_reduce_token(
         const __ppu_bfloat16* __restrict__ input,
         __ppu_bfloat16* __restrict__ output,
         const int64_t (&slots)[kTopK], const float (&weights)[kTopK],
         const bool (&remote_slots)[kTopK], int token) {
     constexpr int kVector = sizeof(int4) / sizeof(__ppu_bfloat16);
-    constexpr int kStride = kMoeReduceThreads * kVector;
+    constexpr int kStride = kThreads * kVector;
     for (int column = threadIdx.x * kVector;
          column < kHidden; column += kStride) {
         float accumulator[kVector] = {0.0f};
@@ -28,7 +29,7 @@ __device__ __forceinline__ void moe_reduce_token(
                 slots[index] * kHidden + column;
             int4 packed;
             // Match the remote bulk and local vector layouts written by scatter.
-            if (remote_slots[index]) {
+            if (kBulkScatter && remote_slots[index]) {
                 const uint4 bulk = __ppu_global_ldcg_bulk_b32x4(source);
                 packed = *reinterpret_cast<const int4*>(&bulk);
             } else {
@@ -55,17 +56,17 @@ __device__ __forceinline__ void moe_reduce_token(
 }
 
 // GEMM2 scatter completes peer synchronization before this weighted reduction.
-template <int kTopK, int kHidden>
+template <int kTopK, int kHidden, int kThreads = kMoeReduceThreads,
+          bool kBulkScatter = true>
 __device__ __forceinline__ void moe_reduce_impl(
         const __ppu_bfloat16* __restrict__ input,
         const int32_t* __restrict__ topk_indices,
         const float* __restrict__ topk_weights,
         __ppu_bfloat16* __restrict__ output,
-        int max_m, int local_experts, int rank_idx) {
+        int max_m, int local_experts, int rank_idx, int token = -1) {
     static_assert(kHidden % 256 == 0,
                   "remote bulk reduction requires complete 256-element warp rows");
-    // The sole launcher uses one CTA per token.
-    const int token = blockIdx.x;
+    if (token < 0) token = blockIdx.x;
 
     int64_t slots[kTopK];
     float weights[kTopK];
@@ -89,10 +90,10 @@ __device__ __forceinline__ void moe_reduce_impl(
 
     // Skip invalid slots before loading scatter data, even when their weight is zero.
     if (all_valid) {
-        moe_reduce_token<false, kTopK, kHidden>(
+        moe_reduce_token<false, kTopK, kHidden, kThreads, kBulkScatter>(
             input, output, slots, weights, remote_slots, token);
     } else {
-        moe_reduce_token<true, kTopK, kHidden>(
+        moe_reduce_token<true, kTopK, kHidden, kThreads, kBulkScatter>(
             input, output, slots, weights, remote_slots, token);
     }
 }

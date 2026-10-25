@@ -153,6 +153,13 @@ if __name__ == '__main__':
     extra_cxx_args = ["-O3", "-std=c++17", "-DUSE_HGGC"]
     extra_hgcc_args = ["-O3", "-std=c++17", "--use_fast_math", "-DUSE_HGGC"]
 
+    # PPU images using CUDA ABI PyTorch need its runtime types for CUDAStream,
+    # while expert kernels and BLAS calls continue to use native PPU headers.
+    if os.environ.get('DG_TORCH_CUDA_ABI') == '1':
+        extra_cxx_args.append('-DDG_TORCH_CUDA_ABI=1')
+        build_include_dirs.append(os.path.join(
+            ppu_sdk, 'CUDA_SDK', 'targets', 'x86_64-linux', 'include'))
+
     ppu_sdk_version = get_ppu_sdk_version()
     if ppu_sdk_version >= (2, 0, 0):
         extra_cxx_args.append("-DDG_HGGC_SUPPORT_PCH=1")

@@ -8,7 +8,8 @@ template <int N, int K, int BM, int BN, int BK, int WM, int WN,
           int Groups, int Stages, int Ranks, MegaMoEStage Stage,
           int CopyBlocks = 0, int KTilesPerFlag = 0,
           int SourceCapacity = 1, int TopK = 1,
-          bool ApplyClamp = false, bool WideScatterOffset = false>
+          bool ApplyClamp = false, bool WideScatterOffset = false,
+          bool PreserveBf16 = false, bool FuseReduce = false>
 struct MegaMoEFp4Kernel {
     static_assert(Stage == MegaMoEStage::Linear1 || Stage == MegaMoEStage::Linear2,
                   "unsupported MegaMoE stage");
@@ -44,18 +45,20 @@ struct MegaMoEFp4Kernel {
         uint16_t, cutlass::detail::TagToStrideB_t<cutlass::layout::RowMajor>,
         typename OperandSFB::GmemTiledCopy, typename OperandSFB::SmemLayoutAtom,
         FP4DynamicTileId::Disabled,
-        kIsLinear1 ? DispatchBufferLayout::k_scale_blocks_for_hidden(K * 2) : 0>;
+        kIsLinear1 ? DispatchBufferLayout::k_scale_blocks_for_hidden(K * 2) : 0,
+        kIsLinear1 && Ranks == 8 && N == 4096 && K == 2048 && Groups == 32>;
     using ActivationEpilogue = cutlass::epilogue::collective::EpilogueSiluAndMulPostQuant<
         StrideCD, StrideCD,
         cutlass::epilogue::thread::LinearCombination<
             ElementD, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing,
             cutlass::FloatRoundStyle::round_to_nearest, float>,
-        cutlass::gemm::EpilogueDefault, N % BN == 0, ApplyClamp>;
+        cutlass::gemm::EpilogueDefault, N % BN == 0, ApplyClamp, PreserveBf16>;
     using ScatterEpilogue = epilogue::Fp4ScatterEpilogue<
         StrideCD, StrideCD, Layout<Shape<Int<(BM / WM) * 16>, Int<BN>>, cute::Stride<Int<BN>, _1>>,
         Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, float>, float, ElementD,
         cutlass::epilogue::thread::LinearCombination<ElementD, 16, float, float>,
-        Ranks, WideScatterOffset>;
+        Ranks, WideScatterOffset, FuseReduce,
+        Ranks == 8 && N == 4096 && K == 1024 && Groups == 32>;
     using Epilogue = std::conditional_t<kIsLinear1, ActivationEpilogue, ScatterEpilogue>;
     using Scheduler = DeepGemmScheduler<
         kGemmType, N, K, BM, BN, Groups, ceil_div(N, BN),

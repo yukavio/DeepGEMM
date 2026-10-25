@@ -6,13 +6,19 @@
 #include <hggc_runtime_api.h>
 #include <torch/version.h>
 #include <torch/torch.h>
+#if !defined(DG_TORCH_CUDA_ABI)
 #include <ATen/cuda/CUDAContext.h>
+#endif
 #include <c10/cuda/CUDAStream.h>
 
 #include "../utils/exception.hpp"
 #include "../utils/lazy_init.hpp"
 
+#if defined(DG_TORCH_CUDA_ABI)
+#define PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE 0
+#else
 #define PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE (TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3))
+#endif
 
 namespace deep_gemm {
 

@@ -26,7 +26,8 @@ template <
   class ThreadEpilogueOp_,
   class EpilogueSchedule_,
   bool IsAlignedN = false, // ProblemN % blockN == 0, used for deepgemm
-  bool kApplySwigluLimit = false
+  bool kApplySwigluLimit = false,
+  bool kPreserveBf16 = false
 >
 class EpilogueSiluAndMulPostQuant: public DefaultEpilogueNoTsm<StrideC_, StrideD_, ThreadEpilogueOp_, EpilogueSchedule_, IsAlignedN>{
 public:
@@ -41,6 +42,15 @@ public:
 
   using VectorTypeOutputScale = Array<uint8_t, 2>;
   static constexpr int TSM_PADDING = 4; // padding 1 float for bankconflict
+
+  // Preserve an unfused BF16 GEMM1 boundary without writing it to global memory.
+  // RTP's clamped SwiGLU retains FP32 products after that boundary, while the
+  // unclamped path rounds both SiLU and its product back to BF16.
+  static CUTLASS_DEVICE float round_bf16_input(float value) {
+    if constexpr (kPreserveBf16)
+      return __bfloat162float(__float2bfloat16_rn(value));
+    return value;
+  }
 
   static constexpr size_t get_shared_storage_size(int block_m, int block_n) {
     return size_t(block_m) * (block_n / 2 + TSM_PADDING) * sizeof(ElementAccumulator);
@@ -113,7 +123,13 @@ public:
       // Scale Round Up as OCP decalared.
       // scale_bits_u32[step_n] = __float_as_uint(group_max_fp32 * (1.f / 6.f));
       // 0x1400000u means that 6.0 can be termed as 4 * 1.5 which can be represented by u32.
-      scale_bits_u32[step_n] = group_max_fp32 - 0x1400000u; // ceil to power of 2;
+      if constexpr (kPreserveBf16) {
+        // Bit subtraction approximates division by six near exponent boundaries.
+        // Match the standalone activation kernel's rounded FP32 multiply instead.
+        scale_bits_u32[step_n] = __float_as_uint(__fmul_rn(__uint_as_float(group_max_fp32), 1.f / 6.f));
+      } else {
+        scale_bits_u32[step_n] = group_max_fp32 - 0x1400000u;
+      }
     });
 
     // 3. calculate scales-0: round up
@@ -138,6 +154,8 @@ public:
 
       // do quant
       auto val_quanted_tXv0 = rC[step_n] * scale_inv;
+      if constexpr (kPreserveBf16 && !kApplySwigluLimit)
+        val_quanted_tXv0 = round_bf16_input(val_quanted_tXv0);
       auto val_quanted_tXv0_adjecent = __shfl_xor_sync(0xffffffff, val_quanted_tXv0, 1);
       val_2f4_packeds[step_n] = pcnvt_f4x2_f32x2(val_quanted_tXv0_adjecent, val_quanted_tXv0);
     });
@@ -261,10 +279,10 @@ public:
             // 0. sigmoid only for better compute deps
             if constexpr (kApplySwigluLimit) {
               // using mul_accums[warp_iter_n][mma_n] to store gate_clamped
-              mul_accums[warp_iter_n][mma_n] = min(input_array[0], params.swiglu_limit);
+              mul_accums[warp_iter_n][mma_n] = min(round_bf16_input(input_array[0]), round_bf16_input(params.swiglu_limit));
               sigmoid_accums[warp_iter_n][mma_n] = sigmoid_accumulator(mul_accums[warp_iter_n][mma_n]);
             } else {
-              sigmoid_accums[warp_iter_n][mma_n] = sigmoid_accumulator(input_array[0]);
+              sigmoid_accums[warp_iter_n][mma_n] = sigmoid_accumulator(round_bf16_input(input_array[0]));
             }
           });
         });
@@ -275,7 +293,7 @@ public:
               mul_accums[warp_iter_n][mma_n] = mul_accumulator(mul_accums[warp_iter_n][mma_n], sigmoid_accums[warp_iter_n][mma_n]);
             } else {
               FragmentAccumulator input_array = *reinterpret_cast<const FragmentAccumulator*>(accumulators(make_coord(_, mma_m, mma_n), warp_iter_m, warp_iter_n).data());
-              mul_accums[warp_iter_n][mma_n] = mul_accumulator(input_array[0], sigmoid_accums[warp_iter_n][mma_n]);
+              mul_accums[warp_iter_n][mma_n] = round_bf16_input(mul_accumulator(round_bf16_input(input_array[0]), sigmoid_accums[warp_iter_n][mma_n]));
             }
           });
         });
@@ -284,10 +302,10 @@ public:
           cute::for_each(make_int_sequence<MMA_N>{}, [&](auto mma_n) {
             FragmentAccumulator input_array = *reinterpret_cast<const FragmentAccumulator*>(accumulators(make_coord(_, mma_m, mma_n), warp_iter_m, warp_iter_n).data());
             if constexpr (kApplySwigluLimit) {
-              auto up_clamped = max(min(input_array[1], params.swiglu_limit), -params.swiglu_limit);
+              auto up_clamped = max(min(round_bf16_input(input_array[1]), round_bf16_input(params.swiglu_limit)), -round_bf16_input(params.swiglu_limit));
               sigmoid_accums[warp_iter_n][mma_n] = mul_accumulator(mul_accums[warp_iter_n][mma_n], up_clamped);
             } else {
-              sigmoid_accums[warp_iter_n][mma_n] = mul_accumulator(mul_accums[warp_iter_n][mma_n], input_array[1]);
+              sigmoid_accums[warp_iter_n][mma_n] = round_bf16_input(mul_accumulator(mul_accums[warp_iter_n][mma_n], round_bf16_input(input_array[1])));
             }
 
             // dump vals after silu_and_mul
@@ -470,6 +488,10 @@ public:
         apply<false>(problem_shape_mnkl, blk_shape_MNK, blk_coord_mnkl, accumulators, tiled_mma, residue_mnk, thread_idx, smem_buf);
       }
     }
+    // Quantization reads the shared activation tile with a warp-dependent
+    // row count. Join every reader before the next persistent GEMM tile
+    // overwrites the same storage with asynchronous operand loads.
+    __syncthreads();
   }
   
 private:

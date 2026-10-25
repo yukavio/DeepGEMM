@@ -75,7 +75,8 @@ template <
   class GmemTiledCopySFB_,
   class SmemLayoutAtomSFB_,
   FP4DynamicTileId kDynamicTileId = FP4DynamicTileId::Disabled,
-  uint32_t SfaScaleBlocks_ = 0>
+  uint32_t SfaScaleBlocks_ = 0,
+  bool WaitAllSfa_ = false>
 struct CollectiveMmaScaleFp4
 {
   //
@@ -482,6 +483,26 @@ struct CollectiveMmaScaleFp4
     uint32_t ks_cur_stripe = 0;
     int sfa_next_bnd = SfaPartition0KTile;
     uint32_t sfa_cur_partition = 0;
+    if constexpr (SfaScaleBlocks > 0 && WaitAllSfa_) {
+      // Compact experts can place multiple producer partitions in one AIU
+      // cache line. Finish every scale store before the first AIU read can
+      // fetch that line, while retaining the independent FP4 copy pipeline.
+      if (warp_idx == AIU_SFA_WARP && params_.sfa_ready_flags != nullptr) {
+        if (lane_idx == 0) {
+          CUTLASS_PRAGMA_UNROLL
+          for (uint32_t partition = 0;
+               partition < deep_gemm::FusedSfaPartitionLayout::kNumPartitions;
+               ++partition) {
+            while (deep_gemm::ld_copy_ready_uncached(
+                       params_.sfa_ready_flags + partition) !=
+                   params_.sfa_ready_generation) { }
+          }
+        }
+        __syncwarp();
+        sfa_cur_partition = deep_gemm::FusedSfaPartitionLayout::kNumPartitions;
+        sfa_next_bnd = SfaTotalKTiles;
+      }
+    }
     auto wait_stripe = [&]() {
       if constexpr (SfaScaleBlocks > 0) {
         volatile uint32_t* ks_flags = params_.copy_ready_flags;

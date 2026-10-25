@@ -39,10 +39,11 @@ __device__ __forceinline__ void calculate_mxfp4_scales_bf16(
 
 // Quantize each BF16 token once into shared MXFP4/SFA, then scatter it to its top-k expert slots.
 template <int HIDDEN, int TOPK, uint32_t MAX_TOKENS_PER_EXPERT_T,
-          uint32_t NUM_RANKS_T, uint32_t NUM_TOTAL_EXPERTS_T>
+          uint32_t NUM_RANKS_T, uint32_t NUM_TOTAL_EXPERTS_T,
+          typename InputIndex = int32_t, bool HasActiveMask = false>
 __device__ __forceinline__ void mxfp4_quantize_impl(
     const __ppu_bfloat16* __restrict__ input,    // [num_tokens, HIDDEN]
-    const int32_t* __restrict__ topk_ids,       // [num_tokens, topk]
+    const InputIndex* __restrict__ topk_ids,       // [num_tokens, topk]
     const float* __restrict__ topk_weights,
     int32_t* __restrict__ routing_topk_ids,
     float* __restrict__ routing_topk_weights,
@@ -52,7 +53,8 @@ __device__ __forceinline__ void mxfp4_quantize_impl(
     const layout::SymBuffer<>& sym_buffer,
     // Local staging base; peer staging is mapped through sym_buffer.
     uint8_t* __restrict__ local_staging,
-    volatile uint32_t* __restrict__ preprocess_ready_flags) {
+    volatile uint32_t* __restrict__ preprocess_ready_flags,
+    const bool* __restrict__ active_token_mask = nullptr) {
 
     static_assert(HIDDEN >= 2048 && HIDDEN % 1024 == 0,
                   "MegaMoE hidden must be a multiple of 1024 and at least 2048");
@@ -149,9 +151,10 @@ __device__ __forceinline__ void mxfp4_quantize_impl(
         const uint32_t num_routes = num_tokens * TOPK;
         for (uint32_t i = threadIdx.x; i < num_routes;
              i += blockDim.x) {
-            const int expert_idx = __ldg(topk_ids + i);
+            const auto expert_idx = (HasActiveMask && !active_token_mask[i / TOPK])
+                ? InputIndex(-1) : __ldg(topk_ids + i);
             if (expert_idx >= 0 &&
-                static_cast<uint32_t>(expert_idx) < num_total_experts) {
+                static_cast<uint64_t>(expert_idx) < num_total_experts) {
                 const uint32_t owner =
                     static_cast<uint32_t>(expert_idx) / kNumLocalExperts;
                 const uint32_t owner_local =
@@ -185,9 +188,10 @@ __device__ __forceinline__ void mxfp4_quantize_impl(
     if (claim_lane) {
         const int t = SPECIALIZE_ATOMIC_WARP ? lane_id : threadIdx.x;
         const int route_index = token_idx * TOPK + t;
-        const int expert_idx = topk_ids[route_index];
+        const auto expert_idx = (HasActiveMask && !active_token_mask[token_idx])
+            ? InputIndex(-1) : topk_ids[route_index];
         const bool accepted = expert_idx >= 0 &&
-            static_cast<uint32_t>(expert_idx) < num_total_experts;
+            static_cast<uint64_t>(expert_idx) < num_total_experts;
         routing_topk_ids[route_index] = accepted ? expert_idx : -1;
         routing_topk_weights[route_index] = accepted
             ? __ldg(topk_weights + route_index)

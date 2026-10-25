@@ -35,7 +35,7 @@ public:
         int hidden, topk, capacity, ranks, experts;
         LaunchArgs launch_args;
         const void* input;
-        const int32_t* ids;
+        const void* ids;
         const float* weights;
         int32_t* routing_ids;
         float* routing_weights;
@@ -44,26 +44,28 @@ public:
         layout::SymBuffer<> sym_buffer;
         void* staging;
         uint32_t* ready;
+        bool ids64;
+        const bool* active_mask;
     };
 
     static std::string generate_impl(const Args& a) {
         return fmt::format(R"(
 #include <deep_gemm/mxfp4_quant.cuh>
 extern "C" __global__ void megamoe_quant(
-    const __ppu_bfloat16* input, const int32_t* ids, const float* weights,
+    const __ppu_bfloat16* input, const {5}* ids, const float* weights,
     int32_t* routing_ids, float* routing_weights, void* buffer, uint32_t tokens,
-    deep_gemm::layout::SymBuffer<> sym_buffer, uint8_t* staging, uint32_t* ready) {{
-    deep_gemm::mxfp4_quantize_impl<{}, {}, {}, {}, {}>(
+    deep_gemm::layout::SymBuffer<> sym_buffer, uint8_t* staging, uint32_t* ready, const bool* active_mask) {{
+    deep_gemm::mxfp4_quantize_impl<{0}, {1}, {2}, {3}, {4}, {5}, {6}>(
         input, ids, weights, routing_ids, routing_weights, buffer, tokens,
-        sym_buffer, staging, ready);
+        sym_buffer, staging, ready, active_mask);
 }}
-)", a.hidden, a.topk, a.capacity, a.ranks, a.experts);
+)", a.hidden, a.topk, a.capacity, a.ranks, a.experts, a.ids64 ? "int64_t" : "int32_t", a.active_mask != nullptr);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
         DG_HGGC_CHECK(launch_kernel(kernel, config, a.input, a.ids, a.weights,
             a.routing_ids, a.routing_weights, a.buffer, a.tokens, a.sym_buffer,
-            a.staging, a.ready));
+            a.staging, a.ready, a.active_mask));
     }
 };
 
@@ -77,6 +79,7 @@ public:
         const float* weights;
         void* output;
         int capacity, local_experts, rank;
+        bool bulk_scatter;
     };
 
     static std::string generate_impl(const Args& a) {
@@ -84,9 +87,9 @@ public:
 #include <deep_gemm/moe_reduce.cuh>
 extern "C" __global__ void megamoe_reduce(const __ppu_bfloat16* input, const int32_t* ids,
     const float* weights, __ppu_bfloat16* output, int capacity, int local_experts, int rank) {{
-    moe_reduce_impl<{}, {}>(input, ids, weights, output, capacity, local_experts, rank);
+    moe_reduce_impl<{}, {}, kMoeReduceThreads, {}>(input, ids, weights, output, capacity, local_experts, rank);
 }}
-)", a.topk, a.hidden);
+)", a.topk, a.hidden, a.bulk_scatter);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
@@ -114,6 +117,11 @@ template <int Ranks>
 struct ScatterParams : FP4GemmRuntime::GemmKernelParamsT<ScatterEpilogueParams> {
     layout::SymBuffer<Ranks> buffer{};
     int32_t* barrier = nullptr;
+    const void* reduce_input = nullptr;
+    const int32_t* reduce_ids = nullptr;
+    const float* reduce_weights = nullptr;
+    void* reduce_output = nullptr;
+    int reduce_tokens = 0, reduce_capacity = 0, reduce_rank = 0;
 };
 
 template <MegaMoEStage Stage, int Ranks>
@@ -137,7 +145,7 @@ public:
     struct LaunchInfo {
         int n, k, block_m, block_n, block_k, warp_m, warp_n, num_groups, num_stages;
         int copy_blocks = 0, k_tiles_per_flag = 0, source_capacity = 1, topk = 1;
-        bool apply_clamp = false, wide_offsets = false;
+        bool apply_clamp = false, wide_offsets = false, preserve_bf16 = false, fuse_reduce = false;
     };
 
     struct GemmArguments {
@@ -152,6 +160,11 @@ public:
     struct ScatterGemmArguments : GemmArguments {
         layout::SymBuffer<Ranks> scatter_buffer{};
         int32_t* scatter_barrier = nullptr;
+        const void* reduce_input = nullptr;
+        const int32_t* reduce_ids = nullptr;
+        const float* reduce_weights = nullptr;
+        void* reduce_output = nullptr;
+        int reduce_tokens = 0, reduce_capacity = 0, reduce_rank = 0;
     };
     using Arguments = std::conditional_t<kIsLinear1, GemmArguments, ScatterGemmArguments>;
 
@@ -172,6 +185,13 @@ public:
         if constexpr (!kIsLinear1) {
             params.buffer = args.scatter_buffer;
             params.barrier = args.scatter_barrier;
+            params.reduce_input = args.reduce_input;
+            params.reduce_ids = args.reduce_ids;
+            params.reduce_weights = args.reduce_weights;
+            params.reduce_output = args.reduce_output;
+            params.reduce_tokens = args.reduce_tokens;
+            params.reduce_capacity = args.reduce_capacity;
+            params.reduce_rank = args.reduce_rank;
         }
         return params;
     }
@@ -180,7 +200,7 @@ public:
         const auto& info = a.launch_info;
         return fmt::format(R"(
 #include <deep_gemm/impls/mega_moe.cuh>
-using Builder = deep_gemm::MegaMoEFp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 using Kernel = Builder::Kernel;
 static_assert(Kernel::SharedStorageSize == {}, "MegaMoE shared storage size differs from host");
 static_assert(sizeof(Kernel::Params) == {}, "MegaMoE parameter size differs from host");
@@ -196,7 +216,7 @@ __global__ void {}(Kernel::Params params) {{
 )", info.n, info.k, info.block_m, info.block_n, info.block_k, info.warp_m, info.warp_n, info.num_groups, info.num_stages,
             Ranks, kIsLinear1 ? "MegaMoEStage::Linear1" : "MegaMoEStage::Linear2",
             info.copy_blocks, info.k_tiles_per_flag, info.source_capacity, info.topk,
-            info.apply_clamp, info.wide_offsets, a.launch_args.smem_size, sizeof(Params),
+            info.apply_clamp, info.wide_offsets, info.preserve_bf16, info.fuse_reduce, a.launch_args.smem_size, sizeof(Params),
             offsetof(Params, collective_mainloop_params), offsetof(Params, collective_epilogue_params),
             offsetof(Params, scheduler), kName);
     }
@@ -276,7 +296,7 @@ static auto make_linear1_args(const torch::Tensor& rhs, const torch::Tensor& rhs
                               const torch::Tensor& out, const torch::Tensor& out_scale,
                               const torch::Tensor& local_fp4, const torch::Tensor& local_sfa,
                               const MegaMoESchedulerArguments& scheduler,
-                              float swiglu_limit, const MegaMoEStage1Config& config) {
+                              float swiglu_limit, const MegaMoEStage1Config& config, bool preserve_bf16) {
     using Runtime = GemmRuntime<MegaMoEStage::Linear1, Ranks>;
     DG_HOST_ASSERT(config.num_sms > config.copy_blocks &&
                    config.num_sms <= device_runtime->get_prop()->multiProcessorCount);
@@ -300,7 +320,7 @@ static auto make_linear1_args(const torch::Tensor& rhs, const torch::Tensor& rhs
                         .warp_m = config.warp_m, .warp_n = config.warp_n, .num_groups = groups, .num_stages = config.num_stages,
                         .copy_blocks = config.copy_blocks, .k_tiles_per_flag = config.k_tiles_per_flag,
                         .source_capacity = m / Ranks, .topk = compact_m / m,
-                        .apply_clamp = std::isfinite(swiglu_limit)},
+                        .apply_clamp = std::isfinite(swiglu_limit), .preserve_bf16 = preserve_bf16},
         .launch_args = {dim3(1), dim3((config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32), config.smem_bytes},
         .kernel_params = Runtime::to_underlying_arguments_rtc(gemm_args)};
 }
@@ -311,7 +331,9 @@ static auto make_linear2_args(const torch::Tensor& lhs, const torch::Tensor& lhs
                              int32_t* masked_m, const void* src_info,
                              const layout::SymBuffer<Ranks>& scatter_buffer, int32_t* barrier,
                              int token_capacity, int topk,
-                             const MegaMoEStageConfig& config) {
+                             const MegaMoEStageConfig& config, bool fuse_reduce,
+                             const torch::Tensor& reduce_input, const torch::Tensor& ids,
+                             const torch::Tensor& weights, const torch::Tensor& y, int num_tokens, int rank) {
     using Runtime = GemmRuntime<MegaMoEStage::Linear2, Ranks>;
     const int m = lhs.size(0), n = rhs.size(1), k = rhs.size(2), groups = rhs.size(0);
     typename Runtime::Arguments gemm_args{};
@@ -324,21 +346,30 @@ static auto make_linear2_args(const torch::Tensor& lhs, const torch::Tensor& lhs
         .scheduler = TileSchedulerArguments(m, masked_m)};
     gemm_args.scatter_buffer = scatter_buffer;
     gemm_args.scatter_barrier = barrier;
+    gemm_args.reduce_input = reduce_input.data_ptr();
+    gemm_args.reduce_ids = ids.data_ptr<int32_t>();
+    gemm_args.reduce_weights = weights.data_ptr<float>();
+    gemm_args.reduce_output = y.data_ptr();
+    gemm_args.reduce_tokens = num_tokens;
+    gemm_args.reduce_capacity = token_capacity;
+    gemm_args.reduce_rank = rank;
     return typename Runtime::Args{
         .launch_info = {.n = n, .k = k, .block_m = config.block_m, .block_n = config.block_n, .block_k = config.block_k,
                         .warp_m = config.warp_m, .warp_n = config.warp_n, .num_groups = groups, .num_stages = config.num_stages,
-                        .wide_offsets = static_cast<int64_t>(topk) * token_capacity * n > UINT32_MAX},
+                        .source_capacity = token_capacity, .topk = topk,
+                        .wide_offsets = static_cast<int64_t>(topk) * token_capacity * n > UINT32_MAX,
+                        .fuse_reduce = fuse_reduce},
         .launch_args = {dim3(1), dim3((config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32), config.smem_bytes},
         .kernel_params = Runtime::to_underlying_arguments_rtc(gemm_args)};
 }
 
 static void reduce(const torch::Tensor& input, const torch::Tensor& ids, const torch::Tensor& weights,
                    const torch::Tensor& output, int num_tokens, int capacity,
-                   int local_experts, int rank) {
+                   int local_experts, int rank, bool bulk_scatter) {
     if (num_tokens == 0) return;
     ReduceRuntime::Args a{static_cast<int>(ids.size(1)), static_cast<int>(output.size(1)),
         {dim3(num_tokens), dim3(512), 0}, input.data_ptr(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
-        output.data_ptr(), capacity, local_experts, rank};
+        output.data_ptr(), capacity, local_experts, rank, bulk_scatter};
     const auto runtime = compiler->build("megamoe_reduce", ReduceRuntime::generate(a));
     ReduceRuntime::launch(runtime, a);
 }
@@ -383,7 +414,7 @@ static void fp4_fp4_mega_moe_impl(
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
     int rank_idx, int num_max_tokens_per_rank, int num_tokens, float activation_clamp,
-    const MegaMoEComputeViews& views, int expected_m,
+    const MegaMoEComputeViews& views, int expected_m, bool preserve_bf16, bool fuse_reduce,
     const std::function<void()>& stage1_done) {
     // Reserved upstream-compatible argument; receive-count accumulation is not implemented yet.
     (void)cumulative_local_expert_recv_stats;
@@ -412,16 +443,19 @@ static void fp4_fp4_mega_moe_impl(
         scatter_buffer.base += views.scatter_offset;
         auto l1_args = make_linear1_args<decltype(r)::value>(
             l1_weights, l1_weights_sf, views.l2_acts, views.l2_acts_sf, views.l1_acts, views.l1_acts_sf,
-            scheduler, activation_clamp, l1_config);
+            scheduler, activation_clamp, l1_config, preserve_bf16);
         auto l2_args = make_linear2_args<decltype(r)::value>(
             views.l2_acts, views.l2_acts_sf, l2_weights, l2_weights_sf, scheduler.grouped_layout, scheduler.src_info,
-            scatter_buffer, views.barrier, num_max_tokens_per_rank, num_topk, l2_config);
+            scatter_buffer, views.barrier, num_max_tokens_per_rank, num_topk, l2_config, fuse_reduce,
+            views.scatter_buffer, views.topk_idx, views.topk_weights, y, num_tokens, rank_idx);
         launch_gemm<Linear1Runtime>(l1_args, l1_config.num_sms);
         if (stage1_done) stage1_done();  // Optional test-only timing marker.
         launch_gemm<Linear2Runtime>(l2_args, l2_config.num_sms);
     });
-    reduce(views.scatter_buffer, views.topk_idx, views.topk_weights, y, num_tokens, num_max_tokens_per_rank,
-           num_experts_per_rank, rank_idx);
+    if (!fuse_reduce)
+        reduce(views.scatter_buffer, views.topk_idx, views.topk_weights, y, num_tokens, num_max_tokens_per_rank,
+               num_experts_per_rank, rank_idx,
+               !(num_ranks == 8 && hidden == 4096 && num_experts_per_rank == 32 && l2_weights.size(2) == 1024));
 }
 
 }  // namespace deep_gemm::mega

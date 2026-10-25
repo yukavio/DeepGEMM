@@ -85,6 +85,15 @@ static MegaMoEStage1Config get_stage1_config(
             GemmType::MegaMoE, 256, min_m == 16 ? 32 : 128, min_m));
         if (fused_tile_fits(config, ranks, groups)) break;
     }
+    // M890P V4 Flash decode (up to 32 local rows, including MTP). Runtime
+    // tuning records remain authoritative; other shapes use the generic path.
+    if (ranks == 8 && groups == 32 && n == 4096 && k == 2048 && sms == 39 && em <= 9 &&
+        !deep_gemm_lut::get_runtime_config(em, n, k * 2, groups,
+            GemmType::MegaMoE, deep_gemm_lut::RuntimeLutKind::FP4)) {
+        config = {sms, 16, 128, 128, 16, 32, 3,
+            std::get<0>(deep_gemm_fp4_common::get_smem_config_fp4(
+                3, 16, 128, 16, 32, 128, n, false, false))};
+    }
     DG_HOST_ASSERT(fused_tile_fits(config, ranks, groups));
     const auto record = select_copy_tile(ranks, n, k, groups, em, config);
     if (record) {
@@ -104,19 +113,28 @@ static MegaMoEStage1Config get_stage1_config(
 }
 
 static MegaMoEStageConfig get_stage2_config(
-    int shape_m, int em, int n, int k, int groups, int sms) {
+    int shape_m, int em, int n, int k, int groups, int sms, int ranks) {
     auto config = make_stage_config(deep_gemm_fp4_common::get_best_configs(
         shape_m, em, n, k, groups, sms, false, false,
         GemmType::MegaMoE, 256, 128));
-    // Remote bulk scatter uses a full warp of eight BF16 values per lane.
+    const bool flash_ep8 = ranks == 8 && n == 4096 && k == 1024 && groups == 32;
+    if (flash_ep8 && sms == 39 && em <= 9 &&
+        !deep_gemm_lut::get_runtime_config(em, n, k * 2, groups,
+            GemmType::MegaMoE, deep_gemm_lut::RuntimeLutKind::FP4)) {
+        config = {sms, 32, 128, 128, 32, 64, 2,
+            std::get<0>(deep_gemm_fp4_common::get_smem_config_fp4(
+                2, 32, 128, 32, 64, 128, n, false, false))};
+    }
+    // Flash may use half-warps for N128. Every Flash tile writes linear
+    // storage, preserving one scatter layout across heterogeneous ranks.
     const int old_bn = config.block_n, old_wn = config.warp_n;
-    if (config.block_n == 128) config.block_n = 256;
+    if (config.block_n == 128 && !flash_ep8) config.block_n = 256;
     config.warp_n = std::max(config.warp_n, 32);
     if (config.block_n != old_bn || config.warp_n != old_wn)
         config.smem_bytes = std::get<0>(deep_gemm_fp4_common::get_smem_config_fp4(
             config.num_stages, config.block_m, config.block_n, config.warp_m, config.warp_n,
             config.block_k, n, false, false));
-    DG_HOST_ASSERT(config.block_n == 256);
+    DG_HOST_ASSERT(config.block_n == 256 || (flash_ep8 && config.block_n == 128));
     // Scatter needs two accumulator tiles in addition to the mainloop resource contract.
     config.smem_bytes = std::max(config.smem_bytes, 2 * (config.block_m / config.warp_m) *
                                 16 * config.block_n * static_cast<int>(sizeof(float)));
@@ -130,7 +148,7 @@ static MegaMoELaunchConfig select_mega_moe(const MegaMoEHeuristicInput& input) {
             input.num_sms, input.num_ranks),
         get_stage2_config(input.num_ranks * input.num_max_tokens_per_rank, input.expected_m,
             input.hidden, input.intermediate_hidden / 2, input.num_experts_per_rank,
-            input.num_sms)
+            input.num_sms, input.num_ranks)
     };
 }
 

@@ -45,6 +45,7 @@ inline const char* get_gemm_type_name(GemmType gemm_type) {
         case GemmType::GroupedNoPad: return "groupednopad";
         case GemmType::GroupedFused: return "groupedfused";
         case GemmType::BatchGemm: return "batchgemm";
+        case GemmType::MegaMoE: return "megamoe";
     }
     throw std::runtime_error("Unsupported GEMM type");
 }
@@ -89,7 +90,8 @@ inline RuntimeTableState& get_runtime_table_state(RuntimeLutKind kind, GemmType 
 inline bool supports_runtime_lut(GemmType gemm_type) {
     return gemm_type == GemmType::DenseGemm ||
            gemm_type == GemmType::GroupedNoPad ||
-           gemm_type == GemmType::GroupedMasked;
+           gemm_type == GemmType::GroupedMasked ||
+           gemm_type == GemmType::MegaMoE;
 }
 
 inline RuntimeTable load_runtime_lut(const std::string& path, GemmType gemm_type) {

@@ -17,12 +17,16 @@ template <class Epilogue, class = void>
 struct Fp4ScatterTraits {
     static constexpr bool enabled = false;
     static constexpr int world_size = 1;
+    static constexpr bool fuse_reduce = false;
+    static constexpr bool bulk_scatter = true;
 };
 
 template <class Epilogue>
 struct Fp4ScatterTraits<Epilogue, std::void_t<decltype(Epilogue::kWorldSize_)>> {
     static constexpr bool enabled = true;
     static constexpr int world_size = Epilogue::kWorldSize_;
+    static constexpr bool fuse_reduce = Epilogue::kFuseReduce_;
+    static constexpr bool bulk_scatter = !Epilogue::kLinearScatter_;
 };
 
 template <uint32_t kWorldSize>
@@ -36,7 +40,8 @@ template <
     class CopyAtomR2S_, class ElementAccumulator_, class ElementD_,
     class ThreadEpilogueOp_,
     int kWorldSize = 2,
-    bool kWideScatterOffset = false>
+    bool kWideScatterOffset = false, bool kFuseReduce = false,
+    bool kLinearScatter = false>
 class Fp4ScatterEpilogue {
 public:
     using StrideC = StrideC_;
@@ -48,6 +53,8 @@ public:
     using ElementD = ElementD_;
     using ThreadEpilogueOp = ThreadEpilogueOp_;
     static constexpr int kWorldSize_ = kWorldSize;
+    static constexpr bool kFuseReduce_ = kFuseReduce;
+    static constexpr bool kLinearScatter_ = kLinearScatter;
 
     struct SharedStorage {
         cute::array_aligned<ElementAccumulator,
@@ -121,7 +128,12 @@ public:
 
         constexpr int kSmemM = size<0>(shared_accumulator);
         constexpr int kSmemN = size<1>(shared_accumulator);
-        constexpr int kVector = kSmemN / 32;
+        // Flash uses linear stores for every tile width, because ranks may
+        // select different tiles for heterogeneous local token counts.
+        // Bulk scatter requires a complete warp row and a different layout.
+        static_assert(kSmemN == 128 || kSmemN == 256, "unsupported scatter tile width");
+        static_assert(kLinearScatter || kSmemN == 256, "bulk scatter needs full warp rows");
+        constexpr int kVector = 8;
         constexpr int kThreadsPerRow = kSmemN / kVector;
         constexpr int kNumThreads = CUTE_STATIC_V(size(TiledMma{}));
         constexpr int kRowsPerIteration = kNumThreads / kThreadsPerRow;
@@ -237,7 +249,9 @@ public:
                             value.bf16[1] = __floats2bfloat162_rn(low.z, low.w);
                             value.bf16[2] = __floats2bfloat162_rn(high.x, high.y);
                             value.bf16[3] = __floats2bfloat162_rn(high.z, high.w);
-                            if (destination_rank == scatter_buffer.rank_idx) {
+                            if constexpr (kLinearScatter) {
+                                __stbl(reinterpret_cast<int4*>(destination), value.packed);
+                            } else if (destination_rank == scatter_buffer.rank_idx) {
                                 asm volatile(
                                     "ppu.st.global.cg.v4.b32 [%0], {%1, %2, %3, %4};"
                                     :: "l"(destination), "r"(value.packed.x),

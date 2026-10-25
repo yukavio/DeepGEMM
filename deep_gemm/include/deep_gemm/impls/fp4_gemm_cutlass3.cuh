@@ -40,6 +40,7 @@
 #include <deep_gemm/fused_dispatch.cuh>
 #include <deep_gemm/fp4_scatter_barrier.cuh>
 #include <deep_gemm/fp4_scatter_epilogue.cuh>
+#include <deep_gemm/moe_reduce.cuh>
 #include <math.h>
 
 using namespace cute;
@@ -806,6 +807,11 @@ public:
   struct ScatterParams : ParamsBase {
     deep_gemm::epilogue::Fp4ScatterBuffer<kWorldSize> scatter_buffer{};
     deep_gemm::comm::Fp4ScatterBarrierWorkspace* scatter_barrier{nullptr};
+    const void* reduce_input{nullptr};
+    const int32_t* reduce_ids{nullptr};
+    const float* reduce_weights{nullptr};
+    void* reduce_output{nullptr};
+    int reduce_tokens{0}, reduce_capacity{0}, reduce_rank{0};
   };
   using Params = typename cutlass::platform::conditional<
       kEnableScatter, ScatterParams, ParamsBase>::type;
@@ -1140,6 +1146,22 @@ public:
           *params.scatter_barrier,
           params.scatter_buffer,
           gridDim.x, blockIdx.x, threadIdx.x);
+      if constexpr (ScatterTraits::fuse_reduce) {
+        // EP8's separate-kernel path relies on kernel completion to join peer
+        // acquire. In-kernel reduction must join every CTA explicitly first.
+        if constexpr (kWorldSize == 8) {
+          deep_gemm::comm::fp4_scatter_grid_sync(
+              *params.scatter_barrier, gridDim.x, blockIdx.x, threadIdx.x);
+        }
+        for (int token = blockIdx.x; token < params.reduce_tokens; token += gridDim.x) {
+          moe_reduce_impl<TileScheduler::kNumTopK, TileScheduler::SHAPE_N, MaxThreadsPerBlock,
+                          ScatterTraits::bulk_scatter>(
+              static_cast<const __ppu_bfloat16*>(params.reduce_input),
+              params.reduce_ids, params.reduce_weights,
+              static_cast<__ppu_bfloat16*>(params.reduce_output),
+              params.reduce_capacity, TileScheduler::kNumGroups, params.reduce_rank, token);
+        }
+      }
     }
   }
 };

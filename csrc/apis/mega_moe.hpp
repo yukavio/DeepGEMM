@@ -62,10 +62,15 @@ static auto get_symm_buffer_size_for_mega_moe(
 static void quant(const torch::Tensor& x, const torch::Tensor& ids, const torch::Tensor& weights,
                   const torch::Tensor& sym_buffer, const std::vector<int64_t>& buffer_ptrs,
                   int ranks, int experts, int capacity, int rank,
-                  int intermediate) {
+                  int intermediate, const std::optional<torch::Tensor>& active_mask) {
     DG_HOST_ASSERT(sym_buffer.is_cuda());
     DG_HOST_ASSERT(x.device() == sym_buffer.device() && ids.device() == sym_buffer.device() &&
                    weights.device() == sym_buffer.device());
+    DG_HOST_ASSERT(ids.scalar_type() == torch::kInt32 || ids.scalar_type() == torch::kInt64);
+    if (active_mask) {
+        DG_HOST_ASSERT(active_mask->device() == x.device() && active_mask->scalar_type() == torch::kBool &&
+                       active_mask->is_contiguous() && active_mask->dim() == 1 && active_mask->size(0) == x.size(0));
+    }
     const int hidden = x.size(1), topk = ids.size(1);
     const auto layout = get_mega_moe_buffer_layout(
         ranks, experts, capacity, topk, hidden, intermediate);
@@ -74,11 +79,12 @@ static void quant(const torch::Tensor& x, const torch::Tensor& ids, const torch:
     check_mega_moe_buffer(sym_buffer, layout);
     auto* base = sym_buffer.data_ptr<uint8_t>();
     QuantRuntime::Args a{hidden, topk, capacity, ranks, experts,
-        {dim3(1), dim3(256), 0}, x.data_ptr(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+        {dim3(1), dim3(256), 0}, x.data_ptr(), ids.data_ptr(), weights.data_ptr<float>(),
         reinterpret_cast<int32_t*>(base + layout.topk_idx.offset),
         reinterpret_cast<float*>(base + layout.topk_weights.offset), base + layout.dispatch.offset,
         static_cast<uint32_t>(x.size(0)), layout::SymBuffer<>(buffer_ptrs, rank), base + layout.staging.offset,
-        reinterpret_cast<uint32_t*>(base + layout.preprocess_ready.offset)};
+        reinterpret_cast<uint32_t*>(base + layout.preprocess_ready.offset),
+        ids.scalar_type() == torch::kInt64, active_mask ? active_mask->data_ptr<bool>() : nullptr};
     const auto runtime = compiler->build("megamoe_quant", QuantRuntime::generate(a));
     const int count_blocks = experts / ranks;
     const int resident = resident_blocks(runtime, 256, 0) * device_runtime->get_prop()->multiProcessorCount;
@@ -99,7 +105,8 @@ static void fp4_fp4_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::tuple<int, int, int>& recipe, const std::string& activation,
     const std::optional<float>& activation_clamp_opt, const bool& fast_math,
-    const std::optional<int>& expected_m, const std::function<void()>& stage1_done) {
+    const std::optional<int>& expected_m, const bool& preserve_bf16, const bool& fuse_reduce,
+    const std::function<void()>& stage1_done) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
@@ -205,13 +212,16 @@ static void fp4_fp4_mega_moe(
         std::make_tuple(l2_weights, l2_weights_sf_t),
         cumulative_local_expert_recv_stats, sym_buffer_ptrs,
         rank_idx, num_max_tokens_per_rank, num_tokens, activation_clamp,
-        views, em, stage1_done);
+        views, em, preserve_bf16, fuse_reduce, stage1_done);
 }
 
 static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
-    m.def("_mega_moe_quant", &quant);
+    m.def("_mega_moe_quant", &quant,
+          pybind11::arg("x"), pybind11::arg("ids"), pybind11::arg("weights"), pybind11::arg("sym_buffer"),
+          pybind11::arg("buffer_ptrs"), pybind11::arg("ranks"), pybind11::arg("experts"), pybind11::arg("capacity"),
+          pybind11::arg("rank"), pybind11::arg("intermediate"), pybind11::arg("active_mask") = pybind11::none());
 }
 
 }  // namespace deep_gemm::mega
