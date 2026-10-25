@@ -106,7 +106,8 @@ static void fp4_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe, const std::string& activation,
     const std::optional<float>& activation_clamp_opt, const bool& fast_math,
     const std::optional<int>& expected_m, const bool& preserve_bf16, const bool& fuse_reduce,
-    const std::function<void()>& stage1_done) {
+    const std::function<void()>& stage1_done, int stream_phase,
+    const std::optional<torch::Tensor>& stream_workspace) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
@@ -203,6 +204,21 @@ static void fp4_fp4_mega_moe(
         em = expected_m.value();
     }
 
+    TORCH_CHECK(stream_phase >= 0 && stream_phase <= 4, "invalid streamed phase");
+    uint32_t* stream_ptr = nullptr;
+    if (stream_phase) {
+        TORCH_CHECK(stream_workspace && stream_workspace->device() == y.device() &&
+                    stream_workspace->scalar_type() == torch::kInt32 && stream_workspace->dim() == 1 &&
+                    stream_workspace->is_contiguous() && stream_workspace->numel() >= 16 + groups * ceil_div(owner_capacity, int64_t(64)),
+                    "invalid streamed workspace");
+        if (stream_phase > 2) {
+            const int64_t slots = ceil_div(owner_capacity, int64_t(64));
+            const int64_t flag_words = ceil_div(int64_t(16) + groups * slots, int64_t(32)) * 32;
+            TORCH_CHECK(stream_workspace->numel() >= flag_words + groups * slots * 64 * 32 / 2,
+                        "K-block workspace requires isolated scale storage");
+        }
+        stream_ptr = reinterpret_cast<uint32_t*>(stream_workspace->data_ptr<int32_t>());
+    }
     const auto [arch_major, arch_minor] = device_runtime->get_arch_pair();
     if (arch_major != 8 || arch_minor != 9)
         DG_HOST_UNREACHABLE("FP4 MegaMoE requires SM89 (M890)");
@@ -212,12 +228,18 @@ static void fp4_fp4_mega_moe(
         std::make_tuple(l2_weights, l2_weights_sf_t),
         cumulative_local_expert_recv_stats, sym_buffer_ptrs,
         rank_idx, num_max_tokens_per_rank, num_tokens, activation_clamp,
-        views, em, preserve_bf16, fuse_reduce, stage1_done);
+        views, em, preserve_bf16, fuse_reduce, stage1_done, stream_phase, stream_ptr);
 }
 
 static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
+    m.def("_mega_moe_stream_wait_ready", [](const torch::Tensor& workspace) {
+        TORCH_CHECK(workspace.is_cuda() && workspace.scalar_type() == torch::kInt32 &&
+                    workspace.is_contiguous() && workspace.numel() >= 16, "invalid streamed workspace");
+        DG_HGGC_DRIVER_CHECK(hgStreamWaitValue32(reinterpret_cast<HGstream>(current_stream()),
+            reinterpret_cast<HGdeviceptr>(workspace.data_ptr<int32_t>() + 2), 1, HG_STREAM_WAIT_VALUE_EQ));
+    });
     m.def("_mega_moe_quant", &quant,
           pybind11::arg("x"), pybind11::arg("ids"), pybind11::arg("weights"), pybind11::arg("sym_buffer"),
           pybind11::arg("buffer_ptrs"), pybind11::arg("ranks"), pybind11::arg("experts"), pybind11::arg("capacity"),

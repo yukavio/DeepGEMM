@@ -32,6 +32,7 @@ __all__ = [
     "transform_weights_for_mega_moe",
     "fp4_fp4_mega_moe",
     "mega_moe_pre_dispatch",
+    "fp4_fp4_mega_moe_streamed",
 ]
 
 
@@ -39,6 +40,7 @@ __all__ = [
 class _BufferState:
     # Aliases share published input shapes and asynchronous lifetimes.
     input_keepalive: Optional[tuple] = None
+    stream_resources: Optional[tuple] = None
 
 
 class SymmBuffer:
@@ -341,6 +343,8 @@ def fp4_fp4_mega_moe(
     preserve_bf16: bool = False,
     fuse_reduce: bool = False,
     after_gemm1: Optional[Callable[[], None]] = None,
+    _stream_phase: int = 0,
+    _stream_workspace: Optional[torch.Tensor] = None,
 ) -> None:
     """Consume published buffers through the complete C++ MegaMoE entry.
 
@@ -381,4 +385,73 @@ def fp4_fp4_mega_moe(
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         tuple(recipe), activation, activation_clamp, fast_math,
         expected_m, preserve_bf16, fuse_reduce,
-        after_gemm1 if after_gemm1 is not None else getattr(sym_buffer, "_stage1_done", None))
+        after_gemm1 if after_gemm1 is not None else getattr(sym_buffer, "_stage1_done", None), _stream_phase, _stream_workspace)
+
+
+def fp4_fp4_mega_moe_streamed(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    sym_buffer: SymmBuffer,
+    *,
+    activation_clamp: Optional[float] = None,
+    preserve_bf16: bool = True,
+    expected_m: Optional[int] = None,
+    _serial: bool = False,
+    kblock: bool = True,
+) -> None:
+    """Experimental Flash EP8 producer/consumer streams, with unchanged W4A4.
+
+    Warm once outside Graph capture. Each invocation forks after pre-dispatch,
+    retains the original G1/G2 tile resources, then joins both streams before
+    returning to the caller's stream. A native wait-value semaphore prevents
+    G2 admission until every G1 CTA has entered, avoiding producer starvation.
+    _serial is an ablation that also waits for the whole G1 stream to finish.
+    kblock=False waits for the entire producer M block as a control.
+    K-block execution writes intermediate scales to private expert-aligned
+    storage so AIU scale loads cannot prefetch another producer tile. The
+    compact sym_buffer.l2_acts_sf view is not populated by this variant.
+    Aliases and captured graphs must be submitted serially on the same parent
+    stream, as for the underlying SymmBuffer. Destroy graphs before the buffer.
+    No measured speedup or full-service qualification is implied by this API.
+    """
+    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.buffer is None:
+        raise ValueError('a live SymmBuffer is required')
+    if (sym_buffer.group.size(), sym_buffer.num_experts,
+            sym_buffer.hidden, sym_buffer.intermediate_hidden) != (8, 256, 4096, 2048):
+        raise ValueError('streamed MegaMoE supports Flash EP8 only')
+    if y.device != sym_buffer.buffer.device or torch.cuda.current_device() != y.device.index:
+        raise ValueError('select the buffer device before streamed MegaMoE')
+    state = sym_buffer._state
+    if state.stream_resources is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError('warm streamed MegaMoE before Graph capture')
+        slots = ceil_div(8 * sym_buffer.num_max_tokens_per_rank, 64)
+        flag_words = ceil_div(16 + 32 * slots, 32) * 32
+        scale_words = 32 * slots * 64 * 32 // 2
+        workspace = torch.empty(flag_words + scale_words, dtype=torch.int32, device=y.device)
+        state.stream_resources = (workspace, torch.cuda.Stream(device=y.device),
+                                  torch.cuda.Stream(device=y.device))
+    workspace, producer, consumer = state.stream_resources
+    parent = torch.cuda.current_stream()
+    # The preceding parent-stream join also retires the previous invocation.
+    flag_words = ceil_div(16 + 32 * ceil_div(8 * sym_buffer.num_max_tokens_per_rank, 64), 32) * 32
+    workspace[:flag_words].zero_()
+    producer.wait_stream(parent)
+    consumer.wait_stream(parent)
+    arguments = dict(activation_clamp=activation_clamp, preserve_bf16=preserve_bf16,
+                     expected_m=expected_m, _stream_workspace=workspace)
+    try:
+        with torch.cuda.stream(producer):
+            fp4_fp4_mega_moe(y, l1_weights, l2_weights, sym_buffer,
+                            _stream_phase=3 if kblock else 1, **arguments)
+        with torch.cuda.stream(consumer):
+            if _serial:
+                consumer.wait_stream(producer)
+            _C._mega_moe_stream_wait_ready(workspace)
+            fp4_fp4_mega_moe(y, l1_weights, l2_weights, sym_buffer,
+                            _stream_phase=4 if kblock else 2, **arguments)
+    finally:
+        # Also retire enqueued side-stream work when validation/JIT raises.
+        parent.wait_stream(producer)
+        parent.wait_stream(consumer)

@@ -1,4 +1,5 @@
 #pragma once
+#include <deep_gemm/common/mega_moe_kblock.cuh>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
@@ -400,7 +401,11 @@ struct CollectiveMmaScaleFp4
       KTileIterator k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
-      char *smem_buf)
+      char *smem_buf
+#if DG_MOE_KBLOCK
+      , uint32_t* k_ready = nullptr, int source_row = 0
+#endif
+      )
   {
     using namespace cute;
 
@@ -463,6 +468,21 @@ struct CollectiveMmaScaleFp4
     Tensor tSFBsSFB = gmem_thr_copy_SFB.partition_D(sSFB);
 
     auto copy_to_tsm = [&](int k_pipe_write, int k_idx, int warp_idx) {
+#if DG_MOE_KBLOCK
+      if constexpr (SfaScaleBlocks == 0) {
+        // G1 BN128 produces 64 activated FP4 values (32 bytes). Each G2
+        // packed-K tile consumes several complete, cache-line-aligned groups.
+        constexpr int producer_tiles = size<1>(sA) / 32;
+        static_assert(size<1>(sA) % 64 == 0 && producer_tiles < 32);
+        if (warp_idx == 0 || warp_idx == AIU_SFA_WARP) {
+          if (lane_idx == 0) {
+            const uint32_t required = ((1u << producer_tiles) - 1u) << (k_idx * producer_tiles);
+            while ((deep_gemm::stream_moe_load(k_ready) & required) != required) {}
+          }
+          __syncwarp();
+        }
+      }
+#endif
       copy_aiu<SplitAIU>(
         gmem_tiled_copy_A, tAgA(_,_,_,k_idx), tAsA(_,_,_,k_pipe_write),
         gmem_tiled_copy_B, tBgB(_,_,_,k_idx), tBsB(_,_,_,k_pipe_write),

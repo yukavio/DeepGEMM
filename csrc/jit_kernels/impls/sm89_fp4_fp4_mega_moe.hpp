@@ -172,6 +172,9 @@ public:
         LaunchInfo launch_info;
         LaunchArgs launch_args;
         Params kernel_params{};
+        uint32_t* stream_workspace = nullptr;
+        int stream_slots = 0;
+        int stream_mode = 0;
     };
 
     static Params to_underlying_arguments_rtc(const Arguments& args) {
@@ -198,7 +201,8 @@ public:
 
     static std::string generate_impl(const Args& a) {
         const auto& info = a.launch_info;
-        return fmt::format(R"(
+        return fmt::format("#define DG_MOE_STREAMED {}\n#define DG_MOE_KBLOCK {}\n#define DG_MOE_STREAM_SLOTS {}\n",
+                           a.stream_mode != 0, a.stream_mode == 2, a.stream_slots) + fmt::format(R"(
 #include <deep_gemm/impls/mega_moe.cuh>
 using Builder = deep_gemm::MegaMoEFp4Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 using Kernel = Builder::Kernel;
@@ -208,10 +212,10 @@ static_assert(offsetof(Kernel::Params, mainloop) == {}, "MegaMoE mainloop offset
 static_assert(offsetof(Kernel::Params, epilogue) == {}, "MegaMoE epilogue offset differs from host");
 static_assert(offsetof(Kernel::Params, scheduler) == {}, "MegaMoE scheduler offset differs from host");
 extern "C" __launch_bounds__(Kernel::MaxThreadsPerBlock, Kernel::MinBlocksPerMultiprocessor)
-__global__ void {}(Kernel::Params params) {{
+__global__ void {}(Kernel::Params params, uint32_t* streamed) {{
     extern __shared__ char smem[];
     Kernel op;
-    op(params, smem);
+    op(params, smem, streamed);
 }}
 )", info.n, info.k, info.block_m, info.block_n, info.block_k, info.warp_m, info.warp_n, info.num_groups, info.num_stages,
             Ranks, kIsLinear1 ? "MegaMoEStage::Linear1" : "MegaMoEStage::Linear2",
@@ -222,7 +226,7 @@ __global__ void {}(Kernel::Params params) {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
-        DG_HGGC_CHECK(launch_kernel(kernel, config, a.kernel_params));
+        DG_HGGC_CHECK(launch_kernel(kernel, config, a.kernel_params, a.stream_workspace));
     }
 };
 
@@ -415,7 +419,7 @@ static void fp4_fp4_mega_moe_impl(
     const std::vector<int64_t>& sym_buffer_ptrs,
     int rank_idx, int num_max_tokens_per_rank, int num_tokens, float activation_clamp,
     const MegaMoEComputeViews& views, int expected_m, bool preserve_bf16, bool fuse_reduce,
-    const std::function<void()>& stage1_done) {
+    const std::function<void()>& stage1_done, int stream_phase, uint32_t* stream_workspace) {
     // Reserved upstream-compatible argument; receive-count accumulation is not implemented yet.
     (void)cumulative_local_expert_recv_stats;
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -432,6 +436,12 @@ static void fp4_fp4_mega_moe_impl(
     const auto launch_config = select_mega_moe(heuristic_input);
     const auto& l1_config = launch_config.l1;
     const auto& l2_config = launch_config.l2;
+    if (stream_phase) {
+        TORCH_CHECK(stream_workspace && !fuse_reduce && !stage1_done && num_ranks == 8 && hidden == 4096 &&
+                    num_experts_per_rank == 32 && l2_weights.size(2) == 1024 &&
+                    l1_config.block_m == 64 && l1_config.block_n == 128 && l2_config.block_m == 32,
+                    "streamed MegaMoE requires Flash EP8 BM64/BN128 and G2 BM32");
+    }
     auto scheduler = views.scheduler;
     scheduler.sym_buffer = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx);
     scheduler.num_copy_blocks = l1_config.copy_blocks;
@@ -448,11 +458,16 @@ static void fp4_fp4_mega_moe_impl(
             views.l2_acts, views.l2_acts_sf, l2_weights, l2_weights_sf, scheduler.grouped_layout, scheduler.src_info,
             scatter_buffer, views.barrier, num_max_tokens_per_rank, num_topk, l2_config, fuse_reduce,
             views.scatter_buffer, views.topk_idx, views.topk_weights, y, num_tokens, rank_idx);
-        launch_gemm<Linear1Runtime>(l1_args, l1_config.num_sms);
-        if (stage1_done) stage1_done();  // Optional test-only timing marker.
-        launch_gemm<Linear2Runtime>(l2_args, l2_config.num_sms);
+        if (stream_phase) {
+            l1_args.stream_workspace = l2_args.stream_workspace = stream_workspace;
+            l1_args.stream_slots = l2_args.stream_slots = ceil_div(num_ranks * num_max_tokens_per_rank, 64);
+            l1_args.stream_mode = l2_args.stream_mode = stream_phase > 2 ? 2 : 1;
+        }
+        if (stream_phase != 2 && stream_phase != 4) launch_gemm<Linear1Runtime>(l1_args, l1_config.num_sms);
+        if (stage1_done) stage1_done();  // Host enqueue boundary for independent shared-expert work.
+        if (stream_phase != 1 && stream_phase != 3) launch_gemm<Linear2Runtime>(l2_args, l2_config.num_sms);
     });
-    if (!fuse_reduce)
+    if (!fuse_reduce && stream_phase != 1 && stream_phase != 3)
         reduce(views.scatter_buffer, views.topk_idx, views.topk_weights, y, num_tokens, num_max_tokens_per_rank,
                num_experts_per_rank, rank_idx,
                !(num_ranks == 8 && hidden == 4096 && num_experts_per_rank == 32 && l2_weights.size(2) == 1024));

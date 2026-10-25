@@ -1,4 +1,5 @@
 #pragma once
+#include <deep_gemm/common/mega_moe_kblock.cuh>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #include <cutlass/cutlass.h>
@@ -914,7 +915,7 @@ public:
 
   CUTLASS_DEVICE
   void
-  operator()(Params const& params, char* smem_buf) {
+  operator()(Params const& params, char* smem_buf, uint32_t* streamed = nullptr) {
     using namespace cute;
     using X = Underscore;
 
@@ -930,12 +931,20 @@ public:
           params.scheduler, smem_buf, round_generation);
     }
 
-    run_after_prepare(params, smem_buf, round_generation);
+#if DG_MOE_STREAMED
+    if constexpr (TileScheduler::kIsFusedDispatch) {
+      deep_gemm::stream_moe_prepare(streamed, round_generation);
+    } else {
+      __threadfence();
+      round_generation = deep_gemm::stream_moe_load(streamed);
+    }
+#endif
+    run_after_prepare(params, smem_buf, round_generation, streamed);
   }
 
   CUTLASS_DEVICE
   void run_after_prepare(Params const& params, char* smem_buf,
-                         uint32_t round_generation) {
+                         uint32_t round_generation, uint32_t* streamed = nullptr) {
     using namespace cute;
     using X = Underscore;
 
@@ -1016,6 +1025,18 @@ public:
     uint32_t m_block_idx, n_block_idx;
     #pragma clang loop licm(disable)
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
+      uint32_t* k_ready = nullptr;
+#if DG_MOE_STREAMED
+      if constexpr (!TileScheduler::kIsFusedDispatch) {
+        static_assert(64 % BlockM == 0);
+        k_ready = streamed + 16 + deep_scheduler.problem_index() * DG_MOE_STREAM_SLOTS + m_block_idx * BlockM / 64;
+#if !DG_MOE_KBLOCK
+        if (threadIdx.x == 0) while (deep_gemm::stream_moe_load(k_ready) != 32) {}
+        __syncthreads();
+        __threadfence();
+#endif
+      }
+#endif
       auto m_coord = m_block_idx;
       auto n_coord = n_block_idx;
       auto l_coord = 0;
@@ -1039,6 +1060,10 @@ public:
           auto offset_scalea = deep_scheduler.curr_offset_mxfp4_scalea();
           ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
           ptr_scale_A = reinterpret_cast<const ElementSFA*>(params.mainloop.ptr_scale_A) + offset_scalea;
+#if DG_MOE_KBLOCK
+          ptr_scale_A = reinterpret_cast<const ElementSFA*>(deep_gemm::stream_moe_scales(streamed)) +
+              deep_scheduler.problem_index() * DG_MOE_STREAM_SLOTS * 64;
+#endif
       }
       auto offset_b = deep_scheduler.curr_offset_b(m_block_idx);
       auto offset_scaleb = deep_scheduler.curr_offset_mxfp4_scaleb(m_block_idx);
@@ -1051,6 +1076,10 @@ public:
       if constexpr (TileScheduler::kIsFusedDispatch) {
           get<1>(dSFA_local) = static_cast<int64_t>(M);
       }
+#if DG_MOE_KBLOCK
+      if constexpr (!TileScheduler::kIsFusedDispatch)
+          get<1>(dSFA_local) = int64_t(32) * DG_MOE_STREAM_SLOTS * 64;
+#endif
       MainloopParams update_params{};
       update_params.problem_shape = {M, N, K};
       update_params.ptr_A = ptr_A;
@@ -1099,6 +1128,9 @@ public:
         residue_mnk,
         thread_idx,
         smem_buf
+#if DG_MOE_KBLOCK
+        , k_ready, int(m_block_idx * BlockM)
+#endif
       );
 
       // Update the pointer to C and D of MXFP4 in the epilogue parameters
@@ -1111,6 +1143,11 @@ public:
       }
       if constexpr (EpilogueTraits<kEpilogueType>::needs_sfd_offset) {
         params_epilogue_local.ptr_SFD += deep_scheduler.curr_offset_c_scales();
+#if DG_MOE_KBLOCK
+        params_epilogue_local.ptr_SFD = deep_gemm::stream_moe_scales(streamed) +
+            deep_scheduler.problem_index() * DG_MOE_STREAM_SLOTS * 64;
+        params_epilogue_local.shape_m = 32 * DG_MOE_STREAM_SLOTS * 64;
+#endif
       }
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
       if constexpr (kEnableScatter) {
@@ -1139,6 +1176,10 @@ public:
           (char*)&shared_storage.tensors.epilogue
         );
       }
+#if DG_MOE_STREAMED
+      if constexpr (TileScheduler::kIsFusedDispatch)
+        deep_gemm::stream_moe_finish_g1(streamed, deep_scheduler.problem_index(), m_block_idx, n_block_idx);
+#endif
     }
 
     if constexpr (kEnableScatter) {
